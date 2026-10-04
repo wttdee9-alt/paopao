@@ -3,16 +3,19 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
-      - run: pytest -q
+      - run: python -m pytest -q
       - run: pyinstaller --noconfirm --clean --windowed --onefile --name MetaBuyerIntelligence app.py
       - uses: actions/upload-artifact@v4
         with:
