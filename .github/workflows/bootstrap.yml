@@ -1,0 +1,41 @@
+name: Bootstrap Meta Buyer Intelligence
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - mbi_payload.b64
+      - .github/workflows/bootstrap.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Expand project payload
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, zipfile
+          src = Path("mbi_payload.b64")
+          if not src.exists():
+              raise SystemExit("payload already expanded")
+          zip_path = Path("/tmp/mbi_payload.zip")
+          zip_path.write_bytes(base64.b64decode(src.read_text().strip()))
+          with zipfile.ZipFile(zip_path) as z:
+              z.extractall(".")
+          src.unlink()
+          PY
+      - name: Commit expanded project
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Expand Meta Buyer Intelligence project"
+          git push
