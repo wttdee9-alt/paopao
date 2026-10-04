@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS ad_insights(id INTEGER PRIMARY KEY AUTOINCREMENT,date
 CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,ad_id TEXT,quantity_dozen INTEGER,payment_method TEXT,gross_revenue REAL,shipping_cost REAL,cod_fee REAL,product_cost REAL,packaging_cost REAL,status TEXT,province TEXT,region TEXT,first_order INTEGER,customer_name_enc BLOB,customer_phone_enc BLOB,customer_address_enc BLOB);
 CREATE TABLE IF NOT EXISTS recommendations(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,severity TEXT,recommendation_type TEXT,evidence_json TEXT,recommendation_json TEXT,status TEXT DEFAULT 'PENDING',approved_at TEXT);
 """
-DEFAULTS={"demo_mode":True,"currency":"THB","target_cost_per_message":30,"target_cpa":150,"spend_cap_warning":300,"meta_api_version":"v24.0","meta_ad_account_id":"","retail_packages":[{"dozen":1,"prepaid_total":180,"cod_total":190},{"dozen":2,"prepaid_total":360,"cod_total":375},{"dozen":3,"prepaid_total":540,"cod_total":560}],"payment_instructions":""}
+DEFAULTS={"demo_mode":False,"currency":"THB","target_cost_per_message":30,"target_cpa":150,"spend_cap_warning":300,"meta_api_version":"v24.0","meta_ad_account_id":"","retail_packages":[{"dozen":1,"prepaid_total":180,"cod_total":190},{"dozen":2,"prepaid_total":360,"cod_total":375},{"dozen":3,"prepaid_total":540,"cod_total":560}],"payment_instructions":""}
 
 class Database:
     def __init__(self,path=None):
