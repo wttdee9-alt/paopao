@@ -1,0 +1,1155 @@
+#!/usr/bin/env python3
+"""Meta Buyer Intelligence - ไฟล์เดียวรันได้ทันที (Python 3.9+, ไม่ต้องติดตั้งอะไรเพิ่ม)
+รัน Windows:  py "meta_buyer_intelligence.py.txt"
+รัน macOS/Linux:  python3 "meta_buyer_intelligence.py.txt"
+แล้วเปิด http://localhost:8080 (หรือพอร์ตที่โปรแกรมแจ้ง)
+อย่าดับเบิลคลิกไฟล์ .txt เพื่อรัน เพราะ Windows จะเปิดเป็นเอกสารข้อความ
+ไม่ใส่ META_ACCESS_TOKEN = โหมด DEMO (ข้อมูลจำลอง) / ใส่แล้ว = ดึงจาก Meta แบบ read-only
+เพิ่มออเดอร์อัตโนมัติ: /api/chat/messages และ Webhook /webhooks/messenger, /webhooks/line
+ต้องมี HTTPS สาธารณะและตั้ง Webhook ที่บัญชีแชตก่อนรับจริง; ไม่อ่านข้อความแชตจาก Ads token โดยตรง
+ข้อความที่มีที่อยู่ = CONFIRMED; ไม่ถือว่าชำระแล้ว/ขนส่งสำเร็จ ยอดที่ไม่ทราบคงไว้ NULL ให้เติมในหน้าจอ
+Flash Express: ผูกเลขพัสดุ นำเข้า CSV หรือรับ normalized event; ยังไม่เชื่อม API จริงโดยไม่มีเอกสารบัญชี
+ENV เพิ่มเฉพาะการตรวจ Webhook: WEBHOOK_VERIFY_TOKEN, META_APP_SECRET (เดิม), LINE_CHANNEL_SECRET
+ENV (หรือไฟล์ .env ข้างไฟล์นี้): META_ACCESS_TOKEN META_AD_ACCOUNT_ID META_GRAPH_API_VERSION META_MSG_ACTION
+  APP_TOKEN (รหัสเข้า dashboard/API) APP_SECRET PORT DB_PATH SYNC_INTERVAL_MIN
+  TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ALERT_WEBHOOK_URL
+เพิ่ม: แดชบอร์ด SVG 27 ตัวชี้วัด เทียบช่วงก่อน วันที่/แคมเปญ/มิติ ดาวน์โหลด CSV/SVG และพิมพ์ PDF
+ใช้โทเค็นและไฟล์ตั้งค่าเดิมทั้งหมด ไม่ต้องติดตั้งไลบรารีกราฟ ไม่เขียนแก้โฆษณาบน Meta
+ชื่อบริษัท/ลูกค้ากำหนดใน Store config: agency_name, client_name (หนึ่งบัญชีตาม META_AD_ACCOUNT_ID เดิม)
+ยอดขายยืนยันจากออเดอร์จริงแยกจาก Meta Purchase; NEW ไม่นับเป็นยอดขายในแดชบอร์ดใหม่
+ยอดแอดรวมเฉพาะ base grain; วันที่ไม่มีข้อมูลแสดงช่องว่าง ไม่แทนด้วยยอดศูนย์
+VERIFY_WITH_CURRENT_META_DOCS: ตรวจสิทธิ์/fields/breakdowns/attribution ก่อนใช้บัญชีจริง
+"""
+import os, sys, webbrowser, json, time, sqlite3, hashlib, hmac, secrets, random, threading, re, urllib.request, urllib.parse
+from datetime import datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+for _fn in (".env", "config.env"):
+    if os.path.exists(os.path.join(ROOT, _fn)):
+        for ln in open(os.path.join(ROOT, _fn), encoding="utf-8-sig"):
+            if "=" in ln and not ln.strip().startswith("#"):
+                k, v = ln.strip().split("=", 1); os.environ.setdefault(k.strip(), v.strip().strip('"\''))
+env = lambda k, d="": os.environ.get(k, d)
+PORT = int(env("PORT", "8080")); DB = env("DB_PATH", os.path.join(ROOT, "mbi.db")); TOKEN = env("APP_TOKEN")
+TZ = timezone(timedelta(hours=7)); TENANT = "default"
+now = lambda: datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+today = lambda: datetime.now(TZ).date()
+sp = os.path.join(ROOT, ".mbi_secret")
+if env("APP_SECRET"): SECRET = env("APP_SECRET").encode()
+else:
+    if not os.path.exists(sp): open(sp, "w").write(secrets.token_hex(32))
+    SECRET = open(sp).read().strip().encode()
+
+# ---------------- DB ----------------
+L = threading.Lock()
+def q(sql, a=(), one=False, commit=False):
+    with L:
+        c = sqlite3.connect(DB, timeout=30); c.row_factory = sqlite3.Row
+        try:
+            c.execute("PRAGMA synchronous=NORMAL")
+            cur = c.execute(sql, a)
+            if commit: c.commit(); return cur.lastrowid
+            r = [dict(x) for x in cur.fetchall()]; return (r[0] if r else None) if one else r
+        finally: c.close()
+
+SCHEMA = """
+create table if not exists ad_names(ad_id text primary key, ad_name text, campaign_name text);
+create table if not exists adsets(adset_id text primary key, name text, status text, budget real, goal text, targeting text);
+create table if not exists kv(k text primary key, v text);
+create table if not exists orders(id integer primary key autoincrement, tenant_id text, external_order_id text unique, created_at text,
+ customer_key text, source_channel text, campaign_id text, adset_id text, ad_id text, conversation_id text, quantity_dozen int, quantity_units int,
+ payment_method text, gross_revenue real, shipping_fee_charged_customer real, shipping_cost real, cod_fee real, product_cost real, packaging_cost real,
+ status text, province text, region text, first_order int, updated_at text);
+create table if not exists customer_private(tenant_id text, customer_key text, enc_name blob, enc_phone blob, enc_address blob, primary key(tenant_id,customer_key));
+create table if not exists ad_insights(id integer primary key autoincrement, tenant_id text, date text, ad_id text, campaign_id text, adset_id text,
+ grain text, seg text, spend real, impressions int, clicks int, link_clicks int, messages int);
+create index if not exists ix_ins on ad_insights(tenant_id,grain,date);
+create table if not exists recommendations(id integer primary key autoincrement, tenant_id text, rec_key text, created_at text, severity text, type text,
+ entity text, evidence text, recommendation text, status text default 'PENDING', approved_by text, approved_at text, executed_at text, verified_at text);
+create table if not exists alert_events(id integer primary key autoincrement, tenant_id text, created_at text, alert_key text, severity text, title text, payload text);
+create table if not exists audit_logs(id integer primary key autoincrement, tenant_id text, created_at text, actor text, action text, entity text, before_json text, after_json text);
+"""
+def init_db():
+    c = sqlite3.connect(DB)
+    try:
+        c.executescript(SCHEMA)
+        existing = {row[1] for row in c.execute('PRAGMA table_info(ad_insights)')}
+        for column, declaration in {'campaign_name':'TEXT', 'ad_name':'TEXT', 'meta_purchases':'REAL DEFAULT 0', 'meta_purchase_value':'REAL DEFAULT 0'}.items():
+            if column not in existing: c.execute(f'ALTER TABLE ad_insights ADD COLUMN {column} {declaration}')
+        init_chat_schema(c)
+        c.commit()
+    finally: c.close()
+def audit(actor, action, entity, before=None, after=None):
+    q("insert into audit_logs(tenant_id,created_at,actor,action,entity,before_json,after_json) values(?,?,?,?,?,?,?)",
+      (TENANT, now(), actor, action, entity, json.dumps(before, default=str), json.dumps(after, default=str)), commit=True)
+
+DEFAULT_STORE = {"currency": "THB", "agency_name": "", "client_name": "",
+ "retail_packages": [{"dozen": 1, "units": 12, "prepaid_total": 180, "cod_total": 190}, {"dozen": 2, "units": 24, "prepaid_total": 360, "cod_total": 375}, {"dozen": 3, "units": 36, "prepaid_total": 540, "cod_total": 560}],
+ "chat_flow": ["ask_quantity_first", "quote_selected_package_only", "ask_prepaid_or_cod", "collect_shipping_details", "create_order", "update_payment_delivery_status"],
+ "approval_required_for": ["budget_change", "targeting_change", "pause_or_enable", "creative_change"],
+ "product_cost_per_dozen": 90, "shipping_cost": 40, "cod_fee": 15, "packaging_cost": 5,
+ "target_cpa": 150, "cost_msg_ceiling": 30, "meaningful_spend": 300, "cod_refusal_threshold": 0.2, "spend_cap_min": 500,
+ "min_messages": 10, "min_orders": 3, "prior_strength": 10, "alert_cooldown_hours": 6}
+def store():
+    r = q("select v from kv where k='store'", one=True); s = dict(DEFAULT_STORE)
+    if r: s.update(json.loads(r["v"]))
+    return s
+
+# ---------------- PII (stdlib stream cipher; production: เปลี่ยนเป็น AES-GCM/KMS) ----------------
+def _ks(n, nonce):
+    o = b""; i = 0
+    while len(o) < n: o += hmac.new(SECRET, nonce + i.to_bytes(4, "big"), "sha256").digest(); i += 1
+    return o[:n]
+def enc(t):
+    b = (t or "").encode(); n = secrets.token_bytes(12); return n + bytes(x ^ y for x, y in zip(b, _ks(len(b), n)))
+
+# ---------------- Orders ----------------
+ST = ("NEW", "CONFIRMED", "PAID", "SHIPPED", "DELIVERED", "COD_COLLECTED", "CANCELLED", "REFUSED", "RETURNED")
+REV_OK = ("NEW", "CONFIRMED", "PAID", "SHIPPED", "DELIVERED", "COD_COLLECTED"); PAID_OK = ("PAID", "DELIVERED", "COD_COLLECTED")
+def create_order(d, actor="api"):
+    S = store(); pm = d.get("payment_method", "PREPAID"); st = d.get("status", "NEW"); dz = int(d.get("quantity_dozen", 1))
+    if pm not in ("PREPAID", "COD"): raise ValueError("payment_method ต้องเป็น PREPAID|COD")
+    if st not in ST: raise ValueError("status ไม่ถูกต้อง")
+    pkg = next((p for p in S["retail_packages"] if p["dozen"] == dz), None)
+    if not pkg: raise ValueError("ไม่มีแพ็กนี้ใน store config")
+    ext = d.get("external_order_id")
+    if ext:
+        e = q("select id from orders where external_order_id=?", (ext,), one=True)
+        if e: return e["id"]  # idempotent
+    ck = None; c = d.get("customer")
+    if c:
+        ck = hashlib.sha256((str(c.get("phone", "")) + SECRET.hex()).encode()).hexdigest()[:16]
+        q("insert or replace into customer_private values(?,?,?,?,?)", (TENANT, ck, enc(c.get("name")), enc(c.get("phone")), enc(c.get("address"))), commit=True)
+    rev = d.get("gross_revenue", pkg["prepaid_total"] if pm == "PREPAID" else pkg["cod_total"])
+    oid = q("""insert into orders(tenant_id,external_order_id,created_at,customer_key,source_channel,campaign_id,adset_id,ad_id,conversation_id,quantity_dozen,quantity_units,
+      payment_method,gross_revenue,shipping_fee_charged_customer,shipping_cost,cod_fee,product_cost,packaging_cost,status,province,region,first_order,updated_at)
+      values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+      (TENANT, ext, d.get("created_at") or now(), ck, d.get("source_channel", "messenger"), d.get("campaign_id"), d.get("adset_id"), d.get("ad_id"), d.get("conversation_id"),
+       dz, pkg["units"], pm, rev, d.get("shipping_fee_charged_customer", 0), d.get("shipping_cost", S["shipping_cost"]), d.get("cod_fee", S["cod_fee"] if pm == "COD" else 0),
+       d.get("product_cost", S["product_cost_per_dozen"] * dz), d.get("packaging_cost", S["packaging_cost"]), st, d.get("province"), d.get("region", d.get("province")),
+       1 if d.get("first_order", True) else 0, now()), commit=True)
+    audit(actor, "order.create", f"order:{oid}", None, {"status": st}); return oid
+
+def patch_order(oid, d):
+    o = q("select * from orders where id=?", (oid,), one=True)
+    if not o: return None
+    if "status" in d and d["status"] not in ST: raise ValueError("status ไม่ถูกต้อง")
+    f = [k for k in ("status", "province", "region", "payment_method", "gross_revenue", "shipping_cost", "cod_fee", "ad_id", "campaign_id", "adset_id") if k in d]
+    if f: q(f"update orders set {','.join(k+'=?' for k in f)},updated_at=? where id=?", [d[k] for k in f] + [now(), oid], commit=True)
+    audit("api", "order.patch", f"order:{oid}", {k: o[k] for k in f}, {k: d[k] for k in f}); return q("select * from orders where id=?", (oid,), one=True)
+
+# ---------------- Analytics ----------------
+def rng(days): t = today(); return str(t - timedelta(days=days - 1)), str(t)
+def orders_between(a, b): return q("select * from orders where tenant_id=? and substr(created_at,1,10) between ? and ?", (TENANT, a, b))
+def agg_orders(rows):
+    r = dict(orders=0, revenue=0.0, cost=0.0, paid=0, repeat=0, cod=0, refused=0)
+    for o in rows:
+        if o["status"] == "CANCELLED": continue
+        r["orders"] += 1; r["cost"] += (o["product_cost"] or 0) + (o["shipping_cost"] or 0) + (o["cod_fee"] or 0) + (o["packaging_cost"] or 0)
+        if o["status"] in REV_OK: r["revenue"] += o["gross_revenue"] or 0
+        r["paid"] += o["status"] in PAID_OK; r["repeat"] += not o["first_order"]
+        if o["payment_method"] == "COD": r["cod"] += 1; r["refused"] += o["status"] == "REFUSED"
+    return r
+def base_tot(a, b):
+    return q("select coalesce(sum(spend),0) spend,coalesce(sum(impressions),0) impressions,coalesce(sum(link_clicks),0) link_clicks,coalesce(sum(messages),0) messages from ad_insights where grain='base' and tenant_id=? and date between ? and ?", (TENANT, a, b), one=True)
+def sd(x, y): return x / y if y else None
+
+def overview(days=7):
+    a, b = rng(days); t = base_tot(a, b); o = agg_orders(orders_between(a, b)); s = store()
+    return {**t, **o, "cpa": sd(t["spend"], o["orders"]), "roas": sd(o["revenue"], t["spend"]), "close_rate": sd(o["orders"], t["messages"]),
+            "cost_per_message": sd(t["spend"], t["messages"]), "contribution_after_ads": o["revenue"] - o["cost"] - t["spend"], "target_cpa": s["target_cpa"],
+            "open_recommendations": q("select count(*) n from recommendations where status='PENDING'", one=True)["n"],
+            "recent_alerts": q("select severity,title,created_at from alert_events order by id desc limit 5")}
+
+def funnel(days=7):
+    a, b = rng(days); t = base_tot(a, b); rows = orders_between(a, b)
+    return [("Impressions", t["impressions"]), ("Link clicks", t["link_clicks"]), ("Messages", t["messages"]), ("Orders", sum(o["status"] != "CANCELLED" for o in rows)),
+            ("Paid/COD collected", sum(o["status"] in PAID_OK for o in rows)), ("Delivered", sum(o["status"] in ("DELIVERED", "COD_COLLECTED") for o in rows))]
+
+def cod(days=30):
+    a, b = rng(days); rows = [o for o in orders_between(a, b) if o["payment_method"] == "COD"]; c = lambda s: sum(o["status"] == s for o in rows)
+    bad = [o for o in rows if o["status"] in ("REFUSED", "RETURNED")]
+    return {"cod_orders": len(rows), "collected": c("COD_COLLECTED") + c("DELIVERED"), "refused": c("REFUSED"), "returned": c("RETURNED"),
+            "refusal_rate": sd(c("REFUSED"), len(rows)), "loss_estimate": sum((o["shipping_cost"] or 0) + (o["cod_fee"] or 0) + (o["packaging_cost"] or 0) for o in bad)}
+
+def hourly(days=30):
+    a, b = rng(days); cells = {}
+    for r in q("select date,seg,sum(spend) spend,sum(messages) msgs from ad_insights where grain='hourly' and tenant_id=? and date between ? and ? group by date,seg", (TENANT, a, b)):
+        w = datetime.strptime(r["date"], "%Y-%m-%d").weekday(); c = cells.setdefault(f"{w}-{int(r['seg'])}", dict(spend=0, msgs=0, orders=0)); c["spend"] += r["spend"]; c["msgs"] += r["msgs"]
+    for o in orders_between(a, b):
+        if o["status"] == "CANCELLED": continue
+        w = datetime.strptime(o["created_at"][:10], "%Y-%m-%d").weekday(); cells.setdefault(f"{w}-{int(o['created_at'][11:13])}", dict(spend=0, msgs=0, orders=0))["orders"] += 1
+    return cells
+
+def wins(v):
+    s = sorted(v); n = len(s); lo, hi = s[int(.05 * (n - 1))], s[min(n - 1, int(.95 * (n - 1) + .5))]; return [min(max(x, lo), hi) for x in v]
+def norm(v):
+    w = wins(v); lo, hi = min(w), max(w); return [0.5 if hi == lo else (x - lo) / (hi - lo) for x in w]
+
+def segments(dim="ad", days=30):
+    """Segment ที่มี order จริงให้ join ได้: ad / region / hour (age/placement ไม่มี order mapping จึงไม่คำนวณ score)"""
+    a, b = rng(days); S = store(); g = {"ad": "base", "region": "region", "hour": "hourly"}[dim]
+    ins = q("select seg,sum(spend) spend,sum(messages) msgs from ad_insights where grain=? and tenant_id=? and date between ? and ? group by seg", (g, TENANT, a, b))
+    key = {"ad": lambda o: o["ad_id"], "region": lambda o: o["region"], "hour": lambda o: str(int(o["created_at"][11:13]))}[dim]
+    grp = {}
+    for o in orders_between(a, b): grp.setdefault(key(o), []).append(o)
+    rows = []
+    for r in ins:
+        o = agg_orders(grp.get(r["seg"], [])); rows.append({"segment": r["seg"], "spend": r["spend"], "messages": r["msgs"], **o})
+    if not rows: return []
+    tm = sum(r["messages"] for r in rows); to = sum(r["orders"] for r in rows); ts = sum(r["spend"] for r in rows); gc = sd(to, tm) or 0; k = S["prior_strength"]
+    for r in rows:
+        r["close_rate"] = sd(r["orders"], r["messages"]); r["_close"] = (r["orders"] + k * gc) / (r["messages"] + k)
+        r["cpa"] = sd(r["spend"], r["orders"]); r["roas"] = sd(r["revenue"], r["spend"]); r["contribution"] = r["revenue"] - r["cost"] - r["spend"]
+        r["paid_rate"] = sd(r["paid"], r["orders"]); r["cod_refusal_rate"] = sd(r["refused"], r["cod"])
+        r["confidence"] = round(0.4 * min(r["messages"] / 30, 1) + 0.6 * min(r["orders"] / 10, 1), 3)
+    comp = [norm([r["_close"] for r in rows]), norm([1 / r["cpa"] if r["cpa"] else 0 for r in rows]),
+            norm([r["contribution"] / r["orders"] if r["orders"] else min((x["contribution"] / x["orders"] for x in rows if x["orders"]), default=0) for r in rows]),
+            norm([r["paid_rate"] or 0 for r in rows]), norm([sd(r["repeat"], r["orders"]) or 0 for r in rows]), norm([1 - (r["cod_refusal_rate"] or 0) for r in rows])]
+    W = (.30, .25, .20, .10, .10, .05); gcpa = sd(ts, to)
+    for i, r in enumerate(rows):
+        r["buyer_score"] = round(100 * sum(w * c[i] for w, c in zip(W, comp)), 1); why = []
+        if r["close_rate"] is not None and r["close_rate"] > gc: why.append("close rate สูงกว่าค่าเฉลี่ย")
+        if r["cpa"] and gcpa and r["cpa"] < gcpa: why.append("cost/order ต่ำกว่าค่าเฉลี่ย")
+        if r["orders"] == 0 and r["spend"] >= S["meaningful_spend"]: why.append("ใช้งบแล้วไม่มี order")
+        if (r["cod_refusal_rate"] or 0) > S["cod_refusal_threshold"]: why.append("COD refusal สูง")
+        r["why"] = why; sc, cf, m = r["buyer_score"], r["confidence"], r["spend"] >= S["meaningful_spend"]
+        r["action"] = ("SCALE_CANDIDATE" if sc >= 75 and cf >= .65 else "REDUCE_CANDIDATE" if sc < 35 and m else "WATCH" if sc < 55 else "MAINTAIN_OR_TEST")
+        if r["messages"] < S["min_messages"] or r["orders"] < S["min_orders"]: r["action"] = "LOW_SAMPLE"
+        r.pop("_close")
+    return sorted(rows, key=lambda r: (-r["confidence"] >= -0.0, -r["buyer_score"]))
+
+def tsum(t):
+    g = {1: "ชาย", 2: "หญิง"}; geo = t.get("geo_locations", {})
+    loc = [*geo.get("countries", []), *[x.get("name", "") for k in ("regions", "cities") for x in geo.get(k, [])]]
+    ints = [x.get("name", "") for fs in t.get("flexible_spec", []) for x in fs.get("interests", [])]
+    return f"อายุ {t.get('age_min', 18)}-{t.get('age_max', '65+')} | " + ("/".join(g.get(x, "") for x in t.get("genders", [])) or "ทุกเพศ") + " | " + (", ".join(loc[:6]) or "-") + " | ความสนใจ: " + (", ".join(ints[:6]) or "กว้าง/ไม่ระบุ")
+def nm(): return {r["ad_id"]: r["ad_name"] for r in q("select ad_id,ad_name from ad_names")}
+def trend(days=14):
+    a, b = rng(days); return q("select date,sum(spend) spend,sum(messages) msgs,sum(impressions) imp,sum(link_clicks) lc from ad_insights where grain='base' and tenant_id=? and date between ? and ? group by date order by date", (TENANT, a, b))
+def compare(days=7):
+    a, b = rng(days); t = today(); c, p = base_tot(a, b), base_tot(str(t - timedelta(days=2 * days - 1)), str(t - timedelta(days=days)))
+    m = lambda r: {"spend": r["spend"], "messages": r["messages"], "impressions": r["impressions"], "cost_per_message": sd(r["spend"], r["messages"]), "ctr": sd(r["link_clicks"], r["impressions"]), "cpm": sd(r["spend"] * 1000, r["impressions"])}
+    cm, pm = m(c), m(p)
+    return {k: {"cur": cm[k], "prev": pm[k], "delta": (cm[k] - pm[k]) / pm[k] * 100 if cm[k] is not None and pm[k] else None} for k in cm}
+def ads(days=7):
+    a, b = rng(days); n = nm(); S = store()
+    rows = q("select ad_id,sum(spend) spend,sum(impressions) imp,sum(link_clicks) lc,sum(messages) msgs from ad_insights where grain='base' and tenant_id=? and date between ? and ? group by ad_id order by spend desc", (TENANT, a, b))
+    for r in rows: r["name"] = n.get(r["ad_id"], r["ad_id"]); r["cpmsg"] = sd(r["spend"], r["msgs"]); r["ctr"] = sd(r["lc"], r["imp"]); r["enough"] = r["msgs"] >= S["min_messages"]
+    return rows
+def audience(days=30):
+    a, b = rng(days); S = store(); out = {}
+    for g in ("age_gender", "region", "delivery", "device"):
+        rows = q("select seg,sum(spend) spend,sum(impressions) imp,sum(link_clicks) lc,sum(messages) msgs from ad_insights where grain=? and tenant_id=? and date between ? and ? group by seg order by spend desc", (g, TENANT, a, b))
+        ts, tm = sum(r["spend"] for r in rows), sum(r["msgs"] for r in rows); avg = sd(ts, tm)
+        for r in rows:
+            r["share"] = sd(r["spend"], ts) or 0; r["cpmsg"] = sd(r["spend"], r["msgs"]); r["ctr"] = sd(r["lc"], r["imp"]); idx = sd(r["cpmsg"], avg) if r["cpmsg"] and avg else None
+            if r["msgs"] < S["min_messages"] or not idx: r["verdict"] = "ข้อมูลน้อย"
+            else: r["verdict"] = "คุ้ม" if idx <= .8 else "แพงกว่าเฉลี่ย" if idx >= 1.3 else "ปกติ"
+        out[g] = rows
+    return out
+def reconcile(days=30):
+    a, b = rng(days); base = base_tot(a, b); out = []
+    for g in ("age_gender", "region", "delivery", "device", "hourly"):
+        r = q("select coalesce(sum(spend),0) spend from ad_insights where grain=? and tenant_id=? and date between ? and ?", (g, TENANT, a, b), one=True)
+        out.append({"grain": g, "loaded": r["spend"] > 0, "spend": r["spend"], "diff_pct": abs(r["spend"] - base["spend"]) / base["spend"] * 100 if base["spend"] and r["spend"] else None})
+    return {"base_spend": base["spend"], "checks": out}
+def report(days=7):
+    from html import escape as E
+    a, b = rng(days); c = compare(days); o = overview(days); au = audience(days); rc = reconcile(days); S = store()
+    fx = lambda n, d=0: "-" if n is None else f"{n:,.{d}f}"
+    v = lambda k, x: (fx(x * 100, 2) + "%") if (k == "ctr" and x is not None) else fx(x, 1 if k in ("cost_per_message", "cpm") else 0)
+    tb = lambda hd, rows: "<table><tr>" + "".join(f"<th>{E(str(x))}</th>" for x in hd) + "</tr>" + "".join("<tr>" + "".join(f"<td>{E(str(x))}</td>" for x in r) + "</tr>" for r in rows) + "</table>"
+    N = {"spend": "ค่าใช้จ่าย (บาท)", "messages": "ข้อความที่เริ่มสนทนา", "cost_per_message": "ต้นทุนต่อข้อความ", "impressions": "การแสดงผล", "ctr": "CTR ลิงก์", "cpm": "CPM"}
+    h = f"<h1>รายงานผลโฆษณา</h1><p>ช่วง {a} ถึง {b} ({days} วัน) · สร้างเมื่อ {now()}</p><h2>สรุปเทียบช่วงก่อนหน้า</h2>"
+    h += tb(["ตัวชี้วัด", "ช่วงนี้", "ช่วงก่อนหน้า", "เปลี่ยนแปลง"], [[N[k], v(k, c[k]["cur"]), v(k, c[k]["prev"]), "-" if c[k]["delta"] is None else f"{c[k]['delta']:+.1f}%"] for k in N])
+    if o["orders"]: h += "<h2>ยอดขายจากออเดอร์ที่ร้านบันทึก</h2>" + tb(["ออเดอร์", "รายได้", "CPA", "ROAS", "กำไรหลังค่าแอด"], [[o["orders"], fx(o["revenue"]), fx(o["cpa"], 1), fx(o["roas"], 2), fx(o["contribution_after_ads"])]])
+    else: h += "<p><i>ยังไม่มีข้อมูลออเดอร์ในระบบ จึงไม่แสดง CPA/ROAS</i></p>"
+    h += "<h2>แนวโน้มรายวัน</h2>" + tb(["วันที่", "ค่าใช้จ่าย", "ข้อความ", "ต้นทุน/ข้อความ"], [[x["date"], fx(x["spend"]), x["msgs"], fx(sd(x["spend"], x["msgs"]), 1)] for x in trend(days)])
+    h += "<h2>รายโฆษณา</h2>" + tb(["โฆษณา", "ค่าใช้จ่าย", "แสดงผล", "CTR", "ข้อความ", "ต้นทุน/ข้อความ"], [[x["name"], fx(x["spend"]), fx(x["imp"]), v("ctr", x["ctr"]), x["msgs"], fx(x["cpmsg"], 1)] for x in ads(days)])
+    T = {"age_gender": "อายุ × เพศ", "region": "พื้นที่", "delivery": "ตำแหน่งโฆษณา", "device": "อุปกรณ์"}
+    for g, rows in au.items():
+        if rows: h += f"<h2>กลุ่มผู้ชม: {T[g]}</h2>" + tb(["กลุ่ม", "ค่าใช้จ่าย", "สัดส่วน", "ข้อความ", "ต้นทุน/ข้อความ", "ประเมิน"], [[x["seg"].replace("female", "หญิง").replace("male", "ชาย"), fx(x["spend"]), fx(x["share"] * 100, 1) + "%", x["msgs"], fx(x["cpmsg"], 1), x["verdict"]] for x in rows])
+    ok = [x for x in rc["checks"] if x["loaded"]]
+    h += f"<h2>ตรวจความถูกต้อง</h2><p>เทียบยอดค่าใช้จ่ายของแต่ละชุดข้อมูลกับยอดรวมบัญชี: {sum(1 for x in ok if x['diff_pct'] is not None and x['diff_pct'] < 3)}/{len(ok)} ชุดต่างไม่เกิน 3%. ข้อมูลโฆษณามาจาก Meta Marketing API; 'ประเมิน' วัดจากต้นทุนข้อความเทียบค่าเฉลี่ยบัญชีและต้องมีข้อความอย่างน้อย {S['min_messages']} รายการ. ตัวเลขอาจต่างจาก Ads Manager เล็กน้อยตามเวลาอัปเดตและ attribution</p>"
+    return "<!doctype html><meta charset=utf-8><title>รายงานผลโฆษณา</title><style>body{font:14px system-ui,sans-serif;max-width:900px;margin:20px auto;padding:0 12px}table{border-collapse:collapse;width:100%;margin-bottom:12px}th,td{border:1px solid #ccc;padding:5px 8px;text-align:left}th{background:#f1f3f5}@media print{button{display:none}}</style><button onclick=print()>พิมพ์ / บันทึกเป็น PDF</button>" + h
+
+# ---------------- Agency dashboard extension (existing tokens unchanged) ----------------
+DASH_AD_FIELDS = ('spend', 'impressions', 'clicks', 'link_clicks', 'messages', 'meta_purchases', 'meta_purchase_value')
+DASH_ORDER_FIELDS = ('orders', 'revenue', 'order_cost', 'paid_orders', 'cod_orders', 'cod_refused', 'address_orders', 'address_revenue', 'unpriced_orders', 'paid_revenue', 'cod_settled', 'missing_cost_orders')
+
+def dashboard_range(qs):
+    days = int(qs.get('days', 30))
+    if not 1 <= days <= 366: raise ValueError('days ต้องอยู่ระหว่าง 1–366')
+    a, b = rng(days)
+    a, b = qs.get('since', a), qs.get('until', b)
+    start, end = datetime.strptime(a, '%Y-%m-%d').date(), datetime.strptime(b, '%Y-%m-%d').date()
+    if start > end or (end-start).days > 365: raise ValueError('เลือกวันที่เรียงลำดับและไม่เกิน 366 วัน')
+    return str(start), str(end)
+
+def dashboard_derived(r):
+    r.update(ctr=sd(r['clicks']*100, r['impressions']), link_ctr=sd(r['link_clicks']*100, r['impressions']),
+             cpc=sd(r['spend'], r['clicks']), cpm=sd(r['spend']*1000, r['impressions']),
+             cost_per_message=sd(r['spend'], r['messages']), cpa=sd(r['spend'], r['orders']),
+             roas=sd(r['revenue'], r['spend']), close_rate=sd(r['orders']*100, r['messages']),
+             contribution=r['revenue']-r['order_cost']-r['spend'],
+             cod_refusal_rate=sd(r['cod_refused']*100, r['cod_orders']))
+    return r
+
+def dashboard_series(a, b, campaign=''):
+    start, end = datetime.strptime(a, '%Y-%m-%d').date(), datetime.strptime(b, '%Y-%m-%d').date()
+    daily = {}
+    for i in range((end-start).days+1):
+        d = str(start+timedelta(days=i))
+        daily[d] = dict(date=d, has_ads=False, **dict.fromkeys(DASH_AD_FIELDS+DASH_ORDER_FIELDS, 0))
+    where = 'tenant_id=? AND date BETWEEN ? AND ? AND grain=\'base\''
+    args = [TENANT, a, b]
+    if campaign: where += ' AND campaign_id=?'; args.append(campaign)
+    insights = q('SELECT * FROM ad_insights WHERE '+where, args)
+    for item in insights:
+        r = daily[item['date']]; r['has_ads'] = True
+        for field in DASH_AD_FIELDS: r[field] += item.get(field) or 0
+    order_where = 'tenant_id=? AND substr(created_at,1,10) BETWEEN ? AND ?'
+    order_args = [TENANT, a, b]
+    if campaign: order_where += ' AND campaign_id=?'; order_args.append(campaign)
+    orders = q('SELECT * FROM orders WHERE '+order_where, order_args)
+    # This new dashboard separates confirmed sales from NEW/pending orders.
+    successful = ('CONFIRMED', 'PAID', 'SHIPPED', 'DELIVERED', 'COD_COLLECTED')
+    for item in orders:
+        r = daily[item['created_at'][:10]]
+        if item['status'] in successful:
+            r['orders'] += 1; r['revenue'] += item['gross_revenue'] or 0
+            r['order_cost'] += sum(item[k] or 0 for k in ('shipping_cost', 'cod_fee', 'product_cost', 'packaging_cost'))
+        elif item['status'] in ('REFUSED', 'RETURNED'):
+            r['order_cost'] += sum(item[k] or 0 for k in ('shipping_cost', 'cod_fee', 'packaging_cost'))
+        if str(item.get('external_order_id') or '').startswith('chat:'):
+            r['address_orders'] += 1
+            r['address_revenue'] += item['gross_revenue'] or 0
+        if item['status'] in successful and item['gross_revenue'] is None:r['unpriced_orders'] += 1
+        if item['status'] in successful and any(item[k] is None for k in ('shipping_cost','cod_fee','product_cost','packaging_cost')):r['missing_cost_orders'] += 1
+        paid=item['status'] in ('PAID','COD_COLLECTED') or (item['payment_method']=='PREPAID' and item['status']=='DELIVERED')
+        r['paid_orders'] += int(paid)
+        if paid:r['paid_revenue'] += item['gross_revenue'] or 0
+        if item['payment_method'] == 'COD' and item['status'] != 'CANCELLED':
+            r['cod_orders'] += 1; r['cod_refused'] += int(item['status'] == 'REFUSED')
+    settled_where='tenant_id=? AND substr(cod_settled_at,1,10) BETWEEN ? AND ?'
+    settled_args=[TENANT,a,b]
+    if campaign:settled_where+=' AND campaign_id=?';settled_args.append(campaign)
+    for settlement in q('SELECT cod_settled_at,cod_settled_amount FROM orders WHERE '+settled_where,settled_args):
+        daily[settlement['cod_settled_at'][:10]]['cod_settled'] += settlement['cod_settled_amount'] or 0
+    totals = dashboard_derived({k:sum(row[k] for row in daily.values()) for k in DASH_AD_FIELDS+DASH_ORDER_FIELDS})
+    return {'daily':[dashboard_derived(row) for row in daily.values()], 'totals':totals,
+            'ad_days':sum(row['has_ads'] for row in daily.values()), 'order_rows':len(orders)}
+
+def agency_dashboard(qs):
+    a, b = dashboard_range(qs); campaign = qs.get('campaign', '')
+    current = dashboard_series(a, b, campaign)
+    start = datetime.strptime(a, '%Y-%m-%d').date(); end = datetime.strptime(b, '%Y-%m-%d').date()
+    duration = (end-start).days+1
+    pa, pb = str(start-timedelta(days=duration)), str(start-timedelta(days=1))
+    previous = dashboard_series(pa, pb, campaign)
+    compare = {k:{'cur':v, 'prev':previous['totals'][k],
+                  'delta':sd((v-previous['totals'][k])*100, abs(previous['totals'][k]))
+                         if v is not None and previous['totals'][k] is not None else None}
+               for k,v in current['totals'].items()}
+    campaigns = q("SELECT campaign_id,max(campaign_name) name FROM ad_insights WHERE tenant_id=? AND grain='base' AND date BETWEEN ? AND ? AND campaign_id IS NOT NULL GROUP BY campaign_id ORDER BY name", (TENANT,a,b))
+    dimension = qs.get('dimension', 'campaign')
+    grains = {'campaign':('base','campaign_id'), 'ad':('base','ad_id'), 'age_gender':('age_gender','seg'),
+              'region':('region','seg'), 'delivery':('delivery','seg'), 'device':('device','seg'), 'hourly':('hourly','seg')}
+    if dimension not in grains: raise ValueError('dimension ไม่ถูกต้อง')
+    grain, column = grains[dimension]
+    where = 'tenant_id=? AND grain=? AND date BETWEEN ? AND ?'; args = [TENANT,grain,a,b]
+    if campaign: where += ' AND campaign_id=?'; args.append(campaign)
+    groups = q(f"SELECT {column} segment, max(ad_name) ad_name, max(campaign_name) campaign_name, sum(spend) spend, sum(impressions) impressions, sum(clicks) clicks, sum(link_clicks) link_clicks, sum(messages) messages FROM ad_insights WHERE {where} GROUP BY {column} ORDER BY spend DESC", args)
+    for row in groups:
+        row['label'] = (row['campaign_name'] if dimension=='campaign' else row['ad_name'] if dimension=='ad' else None) or row['segment'] or 'ไม่ระบุ'
+        row['ctr'] = sd(row['clicks']*100,row['impressions']); row['cost_per_message'] = sd(row['spend'],row['messages'])
+    warnings = list(JOB.get('warn') or [])
+    if not current['ad_days']: warnings.append('ยังไม่มีข้อมูลแอดในช่วงนี้ — ช่องว่างกราฟไม่ใช่ยอดศูนย์ที่ยืนยันแล้ว')
+    if not current['order_rows']: warnings.append('ยังไม่มีออเดอร์จริงในช่วงนี้ — ห้ามใช้ยอด Purchase ของ Meta แทนยอดขายจริง')
+    if current['totals']['unpriced_orders']:warnings.append(f"มีออเดอร์ยืนยัน {current['totals']['unpriced_orders']} รายการยังไม่ทราบยอดเงิน — ยอดขายที่แสดงยังไม่ครบ กรุณาเติมยอดในเมนูรับออเดอร์จากแชต")
+    if current['totals']['missing_cost_orders']:warnings.append(f"มี {current['totals']['missing_cost_orders']} ออเดอร์ยังขาดต้นทุน — ตัวเลขเหลือหลังต้นทุนยังไม่ครบ ให้เติมต้นทุนในรายละเอียดออเดอร์")
+    if campaign: warnings.append('ยอดออเดอร์ในมุมมองแคมเปญนับเฉพาะออเดอร์ที่ระบุ campaign_id')
+    return {**current, 'since':a, 'until':b, 'previous_since':pa, 'previous_until':pb,
+            'previous_daily':previous['daily'], 'compare':compare, 'campaigns':campaigns,
+            'groups':groups, 'dimension':dimension, 'currency':store().get('currency','THB'),
+            'client_name':store().get('client_name',''), 'agency_name':store().get('agency_name',''),
+            'mode':JOB['mode'], 'last_sync':JOB['last'], 'warnings':warnings}
+
+# CSV contains aggregate data only; download remains protected by the original X-Token.
+def dashboard_csv(qs):
+    import csv, io
+    rows = agency_dashboard(qs)['daily']; output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    return ('\ufeff'+output.getvalue()).encode('utf-8')
+
+# ---------------- Alerts / Recommendations ----------------
+RANK = {"INFO": 0, "WATCH": 1, "ACTION": 2, "URGENT": 3}
+def push_out(sev, title, p):
+    msg = f"[{sev}] {title}\n" + "\n".join(f"{k}: {v}" for k, v in p.items())
+    print(msg)
+    try:
+        if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
+            urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{env('TELEGRAM_BOT_TOKEN')}/sendMessage",
+                urllib.parse.urlencode({"chat_id": env("TELEGRAM_CHAT_ID"), "text": msg}).encode()), timeout=10)
+        if env("ALERT_WEBHOOK_URL"):
+            urllib.request.urlopen(urllib.request.Request(env("ALERT_WEBHOOK_URL"), json.dumps({"severity": sev, "title": title, "payload": p}).encode(), {"Content-Type": "application/json"}), timeout=10)
+    except Exception as e: print("alert delivery failed:", type(e).__name__)
+
+def alert(key, sev, title, p):
+    last = q("select * from alert_events where tenant_id=? and alert_key=? order by id desc limit 1", (TENANT, key), one=True)
+    if last:
+        age = (datetime.now(TZ).replace(tzinfo=None) - datetime.strptime(last["created_at"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600
+        if age < store()["alert_cooldown_hours"] and RANK[sev] <= RANK[last["severity"]]: return
+    q("insert into alert_events(tenant_id,created_at,alert_key,severity,title,payload) values(?,?,?,?,?,?)", (TENANT, now(), key, sev, title, json.dumps(p, ensure_ascii=False)), commit=True); push_out(sev, title, p)
+
+def rec(key, sev, typ, entity, evidence, action):
+    if not q("select 1 x from orders limit 1", one=True): return  # ไม่มีออเดอร์ = ไม่สรุปเรื่องยอดขาย
+    if q("select id from recommendations where rec_key=? and status in ('PENDING','APPROVED')", (key,), one=True): return
+    q("insert into recommendations(tenant_id,rec_key,created_at,severity,type,entity,evidence,recommendation) values(?,?,?,?,?,?,?,?)",
+      (TENANT, key, now(), sev, typ, entity, json.dumps(evidence, ensure_ascii=False), json.dumps({"action": action, "requires_approval": True}, ensure_ascii=False)), commit=True)
+    alert(key, sev, f"{typ}: {entity}", {"เกิดอะไรขึ้น": evidence, "แนะนำ": action, "ต้องอนุมัติ": "ใช่ (ไม่มีการแก้ Meta จนกว่าจะอนุมัติ)"})
+
+def analyze():
+    S = store(); a, b = rng(3); t = today()
+    for r in segments("ad", 30):
+        e = {k: r[k] for k in ("spend", "messages", "orders", "buyer_score", "confidence")}
+        if r["action"] == "SCALE_CANDIDATE": rec(f"scale:{r['segment']}", "ACTION", "SCALE_CANDIDATE", r["segment"], e, "พิจารณาเพิ่มงบแบบค่อยเป็นค่อยไป")
+        if r["action"] == "REDUCE_CANDIDATE": rec(f"reduce:{r['segment']}", "ACTION", "REDUCE_CANDIDATE", r["segment"], e, "พิจารณาลดงบ/หยุดแอด")
+    for ad in q("select distinct ad_id from ad_insights where grain='base' and tenant_id=?", (TENANT,)):
+        ad = ad["ad_id"]; i = q("select sum(spend) s,sum(messages) m,sum(impressions) im from ad_insights where grain='base' and ad_id=? and date between ? and ?", (ad, a, b), one=True)
+        n = agg_orders([o for o in orders_between(a, b) if o["ad_id"] == ad])["orders"]
+        if i["s"] and i["m"] and i["s"] / i["m"] > S["cost_msg_ceiling"] and i["s"] >= S["meaningful_spend"] and n == 0:
+            rec(f"cpm:{ad}", "ACTION", "COST_PER_MESSAGE_HIGH", ad, {"cost_per_message": round(i["s"] / i["m"], 1), "ceiling": S["cost_msg_ceiling"], "orders": 0}, "ตรวจ creative/audience หรือพิจารณาลดงบ")
+        if i["s"] and i["s"] > S["target_cpa"] * 1.5 and n == 0:
+            rec(f"nocpa:{ad}", "ACTION", "SPEND_NO_ORDER", ad, {"spend": round(i["s"]), "target_cpa": S["target_cpa"], "orders": 0}, "พิจารณาหยุดแอดนี้")
+        d = lambda x, y: q("select sum(clicks) c,sum(impressions) i from ad_insights where grain='base' and ad_id=? and date between ? and ?", (ad, str(t - timedelta(days=x)), str(t - timedelta(days=y))), one=True)
+        rc, pv = d(1, 0), d(8, 2)
+        if rc["i"] and pv["i"] and pv["i"] > 1000 and (rc["c"] / rc["i"]) < 0.7 * (pv["c"] / pv["i"]):
+            alert(f"ctr:{ad}", "WATCH", f"CTR ลด >30%: {ad}", {"ctr_ล่าสุด": round(rc["c"] / rc["i"], 4), "ctr_7วันก่อนหน้า": round(pv["c"] / pv["i"], 4), "สาเหตุที่เป็นไปได้": "Creative fatigue", "ต้องอนุมัติ": "ไม่"})
+        last = q("select max(date) d from ad_insights where grain='base' and ad_id=?", (ad,), one=True)["d"]
+        if last and last < str(t - timedelta(days=1)) and q("select sum(impressions) i from ad_insights where ad_id=? and grain='base'", (ad,), one=True)["i"]:
+            alert(f"delivery:{ad}", "ACTION", f"แอดหยุดส่งผลโดยไม่คาดคิด: {ad}", {"ข้อมูลล่าสุด": last})
+    c = cod(30)
+    if c["cod_orders"] >= 5 and (c["refusal_rate"] or 0) > S["cod_refusal_threshold"]:
+        alert("cod_risk", "ACTION", "COD refusal สูง", {"refusal_rate": round(c["refusal_rate"], 3), "ประเมินความเสียหาย": c["loss_estimate"]})
+    x, y = base_tot(*rng(3)), base_tot(str(t - timedelta(days=9)), str(t - timedelta(days=3)))
+    cr = lambda r, d: sd(agg_orders(orders_between(*d))["orders"], r["messages"])
+    nr, pr = cr(x, rng(3)), cr(y, (str(t - timedelta(days=9)), str(t - timedelta(days=3))))
+    if nr is not None and pr and x["messages"] >= 30 and nr < 0.7 * pr:
+        alert("closing_drop", "ACTION", "Close rate ลด >30%", {"ปัจจุบัน": round(nr, 3), "baseline": round(pr, 3), "สาเหตุที่เป็นไปได้": "ปัญหาการปิดการขายในแชท"})
+    try:
+        bs = provider().billing()
+        if bs and bs.get("spend_cap_remaining") is not None and bs["spend_cap_remaining"] < S["spend_cap_min"]:
+            alert("billing", "URGENT", "Spend cap/billing เสี่ยง", bs)
+    except Exception as e: alert("api_cred", "URGENT", "API credential/connector มีปัญหา", {"error": type(e).__name__})
+
+# ---------------- Providers ----------------
+class Meta:
+    """Read-only. ตรวจ field/breakdown/สิทธิ์จาก official Meta docs ก่อน production (แก้ FIELD ด้านล่างได้)"""
+    GRAINS = {"base": [], "age_gender": ["age", "gender"], "region": ["region"], "delivery": ["publisher_platform", "platform_position"],
+              "device": ["device_platform"], "hourly": ["hourly_stats_aggregated_by_advertiser_time_zone"]}  # ดึงแยก query ห้าม merge ข้าม grain
+    def __init__(s):
+        s.v = env("META_GRAPH_API_VERSION", "v21.0"); s.t = env("META_ACCESS_TOKEN"); a = env("META_AD_ACCOUNT_ID"); s.acc = a if a.startswith("act_") else "act_" + a
+        s.msg = env("META_MSG_ACTION", "onsite_conversion.messaging_conversation_started_7d")
+    def get(s, path, params):
+        url = f"https://graph.facebook.com/{s.v}/{path}?" + urllib.parse.urlencode({**params, "access_token": s.t}); out = []
+        while url:
+            for att in range(5):
+                try: d = json.load(urllib.request.urlopen(url, timeout=60)); break
+                except Exception:
+                    if att == 4: raise RuntimeError("Meta API error (token ไม่แสดงใน log)")
+                    time.sleep(2 ** att)
+            out += d.get("data", [d] if "data" not in d else []); url = d.get("paging", {}).get("next")
+        return out
+    def billing(s):
+        r = s.get(s.acc, {"fields": "account_status,spend_cap,amount_spent"})[0]; cap = float(r.get("spend_cap") or 0) / 100; sp_ = float(r.get("amount_spent") or 0) / 100
+        return {"account_status": r.get("account_status"), "spend_cap_remaining": (cap - sp_) if cap else None}
+    def sync(s, days=7, since=None, until=None):
+        a, b = (since, until) if since and until else rng(days); JOB["warn"] = []
+        for grain, bd in s.GRAINS.items():
+            try: s.one(grain, bd, a, b)
+            except Exception as e: JOB["warn"].append(f"{grain}: {str(e)[:80]}")
+        if len(JOB["warn"]) == len(s.GRAINS): raise RuntimeError("; ".join(JOB["warn"][:2]))
+        try: s.adsets()
+        except Exception as e: JOB["warn"].append("adsets: " + str(e)[:80])
+    def adsets(s):
+        for x in s.get(f"{s.acc}/adsets", {"fields": "id,name,effective_status,daily_budget,optimization_goal,targeting", "limit": 200}):
+            q("insert or replace into adsets values(?,?,?,?,?,?)", (x["id"], x.get("name"), x.get("effective_status"), float(x.get("daily_budget") or 0) / 100, x.get("optimization_goal"), tsum(x.get("targeting", {}))), commit=True)
+    def one(s, grain, bd, a, b):
+        if True:
+            p = {"level": "ad", "fields": "date_start,campaign_id,campaign_name,adset_id,ad_id,ad_name,spend,impressions,clicks,inline_link_clicks,actions,action_values", "time_increment": 1, "limit": 500,
+                 "time_range": json.dumps({"since": a, "until": b})}
+            if bd: p["breakdowns"] = ",".join(bd)
+            rows = s.get(f"{s.acc}/insights", p)
+            records, names = [], []
+            for r in rows:
+                seg = r["ad_id"] if grain == "base" else "|".join(str(r.get(k, "")) for k in bd)
+                if grain == "hourly": seg = str(int(str(r.get(bd[0], "0"))[:2]))
+                if r.get("ad_name"): names.append((r["ad_id"],r.get("ad_name"),r.get("campaign_name")))
+                actions = {item['action_type']:float(item.get('value') or 0) for item in r.get('actions',[])}
+                values = {item['action_type']:float(item.get('value') or 0) for item in r.get('action_values',[])}
+                purchase = next((key for key in ('purchase','omni_purchase','offsite_conversion.fb_pixel_purchase') if key in actions),None)
+                messages = int(actions.get(s.msg,0))
+                records.append((TENANT,r['date_start'],r.get('ad_id'),r.get('campaign_id'),r.get('adset_id'),grain,seg,
+                    float(r.get('spend') or 0),int(float(r.get('impressions') or 0)),int(float(r.get('clicks') or 0)),
+                    int(float(r.get('inline_link_clicks') or 0)),messages,r.get('campaign_name'),r.get('ad_name'),actions.get(purchase,0),values.get(purchase,0)))
+            # Validate all rows first, then replace one grain in one transaction.
+            # Unsupported optional grains keep their previous data and are reported in JOB.warn.
+            with L:
+                connection = sqlite3.connect(DB,timeout=30)
+                try:
+                    with connection:
+                        connection.execute('delete from ad_insights where tenant_id=? and grain=? and date between ? and ?', (TENANT,grain,a,b))
+                        connection.executemany('insert into ad_insights(tenant_id,date,ad_id,campaign_id,adset_id,grain,seg,spend,impressions,clicks,link_clicks,messages,campaign_name,ad_name,meta_purchases,meta_purchase_value) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',records)
+                        connection.executemany('insert or replace into ad_names values(?,?,?)',names)
+                finally: connection.close()
+
+def seed():
+    random.seed(7); t = today(); S = store()
+    ADS = {"AD_Video_ชานมเย็น": (.17, 1.0), "AD_Image_โปรสามโหล": (.11, .9), "AD_Carousel_ทั่วไป": (.05, 1.1), "AD_Reels_ทดสอบ": (.0, 1.5)}
+    REG = {"กรุงเทพมหานคร": (.3, 1.3), "เชียงใหม่": (.15, 1.0), "ขอนแก่น": (.2, .8), "ชลบุรี": (.2, 1.1), "สงขลา": (.15, .6)}
+    HW = [1 if h < 7 else 4 if h in (11, 12, 13, 19, 20, 21, 22) else 2 for h in range(24)]
+    for dd in range(14, -1, -1):
+        day = t - timedelta(days=dd)
+        for ad, (p, cf) in ADS.items():
+            n = max(10, int(random.gauss(55, 8))); spend = n * random.uniform(20, 31) * cf
+            imp = n * random.randint(70, 95); ctr = 0.025 * (0.55 if ad == "AD_Carousel_ทั่วไป" and dd <= 2 else 1)
+            clicks = int(imp * ctr); G = {"hourly": {}, "region": {}}
+            for _ in range(n):
+                rg = random.choices(list(REG), [v[0] for v in REG.values()])[0]; h = random.choices(range(24), HW)[0]
+                G["hourly"][str(h)] = G["hourly"].get(str(h), 0) + 1; G["region"][rg] = G["region"].get(rg, 0) + 1
+                if random.random() < p * REG[rg][1] * (1.4 if HW[h] == 4 else .8):
+                    pm = "PREPAID" if random.random() < .55 else "COD"; old = dd > 2
+                    stt = (random.choice(["PAID", "DELIVERED", "DELIVERED", "SHIPPED"]) if pm == "PREPAID" else
+                           ("REFUSED" if random.random() < (.38 if rg == "สงขลา" else .12) else random.choice(["COD_COLLECTED", "DELIVERED", "RETURNED"] if old else ["SHIPPED", "CONFIRMED"]))) if old else random.choice(["NEW", "CONFIRMED", "PAID"])
+                    create_order({"created_at": f"{day} {h:02d}:{random.randint(0, 59):02d}:00", "ad_id": ad, "region": rg, "province": rg, "payment_method": pm, "status": stt,
+                                  "quantity_dozen": random.choices([1, 2, 3], [5, 3, 2])[0], "first_order": random.random() < .72}, "seed")
+            q("insert into ad_insights(tenant_id,date,ad_id,grain,seg,spend,impressions,clicks,link_clicks,messages) values(?,?,?,?,?,?,?,?,?,?)", (TENANT, str(day), ad, "base", ad, spend, imp, clicks, int(clicks * .7), n), commit=True)
+            for gr, cnt in G.items():
+                for sg, c in cnt.items():
+                    f = c / n; q("insert into ad_insights(tenant_id,date,ad_id,grain,seg,spend,impressions,clicks,link_clicks,messages) values(?,?,?,?,?,?,?,?,?,?)", (TENANT, str(day), ad, gr, sg, spend * f, int(imp * f), int(clicks * f), int(clicks * .7 * f), c), commit=True)
+
+    q("UPDATE ad_insights SET campaign_id='DEMO_CAMPAIGN',campaign_name='แคมเปญสาธิต',ad_name=ad_id WHERE tenant_id=? AND campaign_id IS NULL", (TENANT,), commit=True)
+    q("UPDATE orders SET campaign_id='DEMO_CAMPAIGN' WHERE tenant_id=? AND campaign_id IS NULL", (TENANT,), commit=True)
+
+class Demo:
+    def sync(s, days=7): pass
+    def billing(s): return {"account_status": 1, "spend_cap_remaining": 5000}
+def provider(): return Meta() if env("META_ACCESS_TOKEN") and env("META_AD_ACCOUNT_ID") else Demo()
+
+JOB = {"warn": [], "running": False, "last": None, "error": None, "mode": "LIVE" if env("META_ACCESS_TOKEN") else "DEMO"}
+def run_sync(days=7, since=None, until=None):
+    if JOB["running"]: return False
+    JOB["running"] = True
+    try:
+        connector = provider()
+        if isinstance(connector, Meta): connector.sync(days,since,until)
+        else: connector.sync(days)
+        analyze(); JOB.update(last=now(), error=None)
+    except Exception as e: JOB["error"] = str(e)[:200]
+    finally: JOB["running"] = False
+    return True
+def loop():
+    while True:
+        time.sleep(int(env("SYNC_INTERVAL_MIN", "60")) * 60); run_sync()
+
+def read_lookalikes():
+    # VERIFY_WITH_CURRENT_META_DOCS: custom audience visibility requires account/app permissions.
+    if not env('META_ACCESS_TOKEN') or not env('META_AD_ACCOUNT_ID'):
+        return {'mode':'DEMO','rows':[], 'note':'ยังไม่มีบัญชี Meta จริงที่เชื่อม จึงยังไม่แสดงกลุ่ม Lookalike จริง'}
+    try:
+        connector=Meta()
+        rows=connector.get(connector.acc+'/customaudiences', {'fields':'id,name,subtype,lookalike_spec','limit':100})
+        return {'mode':'LIVE','rows':[row for row in rows if row.get('subtype')=='LOOKALIKE' or row.get('lookalike_spec')], 'note':'กลุ่มที่โทเค็นเดิมมีสิทธิ์อ่านได้; ตรวจ fields/permissions กับเอกสาร Meta รุ่นที่ใช้อยู่'}
+    except Exception:return {'mode':'LIVE','rows':[], 'error':'โหลด Lookalike ไม่สำเร็จ ต้องตรวจสิทธิ์อ่าน Custom Audience และ API Version ของโทเค็นเดิม'}
+
+# ---------------- Chat orders and shipping (additive; Ads tokens unchanged) ----------------
+CHAT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_conversations(tenant_id TEXT,channel TEXT,conversation_key TEXT,context_enc BLOB,order_key TEXT,order_id INTEGER,updated_at TEXT,PRIMARY KEY(tenant_id,channel,conversation_key));
+CREATE TABLE IF NOT EXISTS chat_events(tenant_id TEXT,channel TEXT,event_id TEXT,conversation_key TEXT,created_at TEXT,order_id INTEGER,PRIMARY KEY(tenant_id,channel,event_id));
+CREATE TABLE IF NOT EXISTS shipping_events(tenant_id TEXT,event_id TEXT,order_id INTEGER,carrier TEXT,tracking_number TEXT,status TEXT,event_time TEXT,cod_amount REAL,applied INTEGER,PRIMARY KEY(tenant_id,event_id));
+"""
+
+def init_chat_schema(connection):
+    connection.executescript(CHAT_SCHEMA)
+    present = {row[1] for row in connection.execute('PRAGMA table_info(orders)')}
+    for key,kind in {'tracking_number':'TEXT','carrier':'TEXT','last_shipping_at':'TEXT','cod_settled_amount':'REAL DEFAULT 0','cod_settled_at':'TEXT','amount_source':'TEXT'}.items():
+        if key not in present: connection.execute(f'ALTER TABLE orders ADD COLUMN {key} {kind}')
+    connection.execute('CREATE INDEX IF NOT EXISTS ix_orders_tracking ON orders(tenant_id,carrier,tracking_number)')
+
+def chat_key(value): return hmac.new(SECRET,str(value).encode(),'sha256').hexdigest()
+
+def chat_seal(value):
+    data=enc(json.dumps(value,ensure_ascii=False))
+    return hmac.new(SECRET,b'chat-context:'+data,'sha256').digest()+data
+
+def chat_open(value):
+    if not value: return {}
+    tag,data=value[:32],value[32:]
+    if not hmac.compare_digest(tag,hmac.new(SECRET,b'chat-context:'+data,'sha256').digest()): raise ValueError('ข้อมูลแชตเสียหายหรือ APP_SECRET ไม่ตรงกับเดิม')
+    nonce,content=data[:12],data[12:]
+    return json.loads(bytes(a^b for a,b in zip(content,_ks(len(content),nonce))).decode())
+
+def chat_time(value=None):
+    if isinstance(value,(int,float)):
+        stamp=float(value)/1000 if float(value)>100000000000 else float(value)
+        result=datetime.fromtimestamp(stamp,TZ)
+    elif value:
+        result=datetime.fromisoformat(str(value).replace('Z','+00:00'))
+        if result.tzinfo is None: result=result.replace(tzinfo=TZ)
+    else: result=datetime.now(TZ)
+    return result.astimezone(TZ).isoformat(timespec='seconds')
+
+def chat_parse(customer_text,quote_text='',fields=None,settings=None):
+    customer_text=customer_text.translate(str.maketrans('๐๑๒๓๔๕๖๗๘๙','0123456789'))
+    fields=dict(fields or {})
+    settings=settings if settings is not None else store()
+    text=customer_text+'\n'+quote_text
+    text=text.translate(str.maketrans('๐๑๒๓๔๕๖๗๘๙','0123456789'))
+    quantities=re.findall(r'(?:จำนวน\s*[:：]?\s*)?([1-9][0-9]*)\s*โหล',text)
+    if quantities:
+        qty=int(quantities[-1])
+        if 1<=qty<=1000:fields['quantity_dozen']=qty
+    payments=list(re.finditer(r'เก็บเงินปลายทาง|ปลายทาง|\bCOD\b|โอนเงิน|ชำระโอน|โอนแล้ว|โอนค่ะ|โอนครับ|\bPREPAID\b',text,re.I))
+    if payments: fields['payment_method']='COD' if re.search(r'ปลายทาง|COD',payments[-1].group(),re.I) else 'PREPAID'
+    totals=re.findall(r'(?:ยอดรวม(?:ทั้งหมด)?|รวมยอด|รวมเงิน|ยอดเงินรวม|ยอดชำระ|รวมทั้งสิ้น|รวม(?:ค่าส่ง)?(?:ทั้งหมด)?|ยอดทั้งหมด)\s*[:：=]?\s*(?:฿\s*)?([0-9][0-9,]*(?:\.[0-9]{1,2})?)(?:\s*(?:บาท|฿))?',text)
+    primary_totals=re.findall(r'(?:ยอดรวม(?:ทั้งหมด)?|รวมยอด|รวมเงิน|ยอดเงินรวม|ยอดชำระ|รวมทั้งสิ้น|ยอดทั้งหมด)\s*[:：=]?\s*(?:฿\s*)?([0-9][0-9,]*(?:\.[0-9]{1,2})?)',text)
+    if primary_totals:totals=primary_totals
+    if totals:
+        fields['gross_revenue']=money_number(totals[-1]);fields['amount_source']='chat_total'
+    if fields.get('gross_revenue') is None and fields.get('quantity_dozen') and fields.get('payment_method'):
+        package=next((p for p in settings['retail_packages'] if p['dozen']==fields['quantity_dozen']),None)
+        if package:
+            fields['gross_revenue']=float(package['cod_total' if fields['payment_method']=='COD' else 'prepaid_total']);fields['amount_source']='store_package'
+    phones=re.findall(r'(?<!\d)(0[689](?:[ -]?\d){8})(?!\d)',customer_text)
+    if phones: fields['phone']=re.sub(r'\D','',phones[-1])
+    names=re.findall(r'(?:ชื่อผู้รับ|ผู้รับ|ชื่อ)\s*[:：]\s*([^\n]+)',customer_text)
+    if names: fields['name']=names[-1].strip()
+    zipcode=re.search(r'(?<!\d)[1-9]\d{4}(?!\d)',customer_text)
+    house=re.search(r'(?:บ้านเลขที่\s*)?\b\d{1,5}/\d{1,5}\b|(?:บ้านเลขที่|เลขที่)\s*\d+',customer_text)
+    area=re.search(r'ตำบล|แขวง|อำเภอ|เขต|จังหวัด|กรุงเทพ|\bต\.|\bอ\.|\bจ\.',customer_text)
+    address_seen=bool((zipcode and area) or (zipcode and house) or (house and area and phones))
+    if address_seen:
+        lines=[line.strip() for line in customer_text.splitlines() if line.strip()]
+        address_lines=[line for line in lines if re.search(r'ตำบล|แขวง|อำเภอ|เขต|จังหวัด|กรุงเทพ|บ้านเลขที่|เลขที่|\d+/\d+|(?<!\d)[1-9]\d{4}(?!\d)',line)]
+        fields['address']='\n'.join(address_lines) or customer_text
+    province=re.findall(r'(?:จังหวัด|จ\.)\s*([ก-๙]+)',customer_text)
+    if province:fields['province']=province[-1]
+    elif re.search(r'กรุงเทพ',customer_text):fields['province']='กรุงเทพมหานคร'
+    fields['address_seen']=address_seen or bool(fields.get('address'))
+    return fields
+
+def money_number(value):
+    import math
+    try: number=float(str(value).replace(',',''))
+    except (ValueError,TypeError): raise ValueError('ยอดเงินต้องเป็นตัวเลข') from None
+    if not math.isfinite(number) or number<0: raise ValueError('ยอดเงินต้องไม่ติดลบและเป็นตัวเลขจำกัด')
+    return number
+
+def receive_chat(data):
+    channel=str(data.get('channel','manual')).lower()
+    if channel not in ('manual','messenger','line'): raise ValueError('channel ต้องเป็น manual, messenger หรือ line')
+    event_id=str(data.get('message_id') or '').strip()
+    conversation=str(data.get('conversation_id') or '').strip()
+    text=str(data.get('text') or '').strip()
+    if not event_id or not conversation or not text or len(text)>20000: raise ValueError('ต้องมี message_id, conversation_id และ text ไม่เกิน 20000 ตัวอักษร')
+    conversation_key=chat_key(channel+':'+conversation);event_id=chat_key(channel+':'+event_id)
+    created_at=chat_time(data.get('created_at'))
+    direction=data.get('direction','customer')
+    if direction not in ('customer','shop'): raise ValueError('direction ต้องเป็น customer หรือ shop')
+    settings=store()
+    with L:
+        connection=sqlite3.connect(DB,timeout=30);connection.row_factory=sqlite3.Row
+        try:
+            with connection:
+                duplicate=connection.execute('SELECT order_id FROM chat_events WHERE tenant_id=? AND channel=? AND event_id=?',(TENANT,channel,event_id)).fetchone()
+                if duplicate: return {'duplicate':True,'order_id':duplicate['order_id']}
+                existing=connection.execute('SELECT * FROM chat_conversations WHERE tenant_id=? AND channel=? AND conversation_key=?',(TENANT,channel,conversation_key)).fetchone()
+                context=chat_open(existing['context_enc']) if existing else {'customer':[],'shop':[],'fields':{}}
+                order_id=existing['order_id'] if existing else None
+                order_key=existing['order_key'] if existing else event_id
+                # Repeated address corrections stay in the same order. New sales use an explicit order boundary.
+                new_intent=direction=='customer' and bool(re.search(r'สั่งเพิ่ม|สั่งอีก|สั่งใหม่|ซื้ออีก|เอาอีก|ออเดอร์ใหม่',text))
+                if data.get('new_order') is True or (new_intent and order_id is not None and created_at>=context.get('latest_at','')):
+                    context={'customer':[],'shop':[],'fields':{}};order_id=None;order_key=event_id
+                context['latest_at']=max(context.get('latest_at',''),created_at)
+                context.setdefault(direction,[]).append(text)
+                context[direction]=context[direction][-30:]
+                fields=chat_parse('\n'.join(context['customer']),'\n'.join(context.get('shop',[])),context.get('fields'),settings)
+                if direction=='customer':
+                    current_fields=chat_parse(text,'',{},settings)
+                    if current_fields.get('address_seen'):fields['address']=current_fields['address']
+                context['fields']=fields
+                context.setdefault('attribution',{}).update({key:data[key] for key in ('campaign_id','adset_id','ad_id') if data.get(key)})
+                if fields.get('address_seen') and (direction=='customer' or order_id is not None):
+                    pkg=next((p for p in settings['retail_packages'] if p['dozen']==fields.get('quantity_dozen')),None)
+                    # No invented total/payment: unknown values remain NULL/UNKNOWN and are visible for review.
+                    amount=fields.get('gross_revenue');payment=fields.get('payment_method','UNKNOWN');quantity=fields.get('quantity_dozen')
+                    customer_key=chat_key(channel+':'+conversation)
+                    connection.execute('INSERT OR REPLACE INTO customer_private VALUES(?,?,?,?,?)',(TENANT,customer_key,enc(fields.get('name')),enc(fields.get('phone')),enc(fields.get('address'))))
+                    if order_id is None:
+                        external='chat:'+channel+':'+conversation_key[:16]+':'+order_key[:16]
+                        cursor=connection.execute('''INSERT INTO orders(tenant_id,external_order_id,created_at,customer_key,source_channel,campaign_id,adset_id,ad_id,conversation_id,quantity_dozen,quantity_units,payment_method,gross_revenue,shipping_fee_charged_customer,shipping_cost,cod_fee,product_cost,packaging_cost,status,province,region,first_order,updated_at,amount_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                            (TENANT,external,created_at,customer_key,channel,context['attribution'].get('campaign_id'),context['attribution'].get('adset_id'),context['attribution'].get('ad_id'),conversation_key,quantity,pkg['units'] if pkg else (quantity*12 if quantity else None),payment,amount,0,settings['shipping_cost'],settings['cod_fee'] if payment=='COD' else 0,settings['product_cost_per_dozen']*quantity if quantity else None,settings['packaging_cost'],'CONFIRMED',fields.get('province'),fields.get('province'),1,now(),fields.get('amount_source')))
+                        order_id=cursor.lastrowid
+                        prior=connection.execute('SELECT 1 FROM orders WHERE tenant_id=? AND customer_key=? AND id<>? LIMIT 1',(TENANT,customer_key,order_id)).fetchone()
+                        if prior:connection.execute('UPDATE orders SET first_order=0 WHERE id=?',(order_id,))
+                        connection.execute('INSERT INTO audit_logs(tenant_id,created_at,actor,action,entity,after_json) VALUES(?,?,?,?,?,?)',(TENANT,now(),'chat','order.address_confirmed',f'order:{order_id}',json.dumps({'status':'CONFIRMED','amount_known':amount is not None})))
+                    else:
+                        order=connection.execute('SELECT * FROM orders WHERE tenant_id=? AND id=?',(TENANT,order_id)).fetchone()
+                        # Do not alter a booked total from subsequent unstructured chat. Operator can edit it explicitly.
+                        if order and order['gross_revenue'] is None and amount is not None:
+                            connection.execute('UPDATE orders SET gross_revenue=?,amount_source=?,updated_at=? WHERE id=?',(amount,fields.get('amount_source'),now(),order_id))
+                        if order and order['payment_method']=='UNKNOWN' and payment!='UNKNOWN':
+                            connection.execute('UPDATE orders SET payment_method=?,updated_at=? WHERE id=?',(payment,now(),order_id))
+                            if payment=='COD':connection.execute('UPDATE orders SET cod_fee=? WHERE id=?',(settings['cod_fee'],order_id))
+                        if order and order['quantity_dozen'] is None and quantity:
+                            connection.execute('UPDATE orders SET quantity_dozen=?,quantity_units=?,updated_at=? WHERE id=?',(quantity,pkg['units'] if pkg else quantity*12,now(),order_id))
+                            connection.execute('UPDATE orders SET product_cost=COALESCE(product_cost,?) WHERE id=?',(settings['product_cost_per_dozen']*quantity,order_id))
+                connection.execute('INSERT OR REPLACE INTO chat_conversations VALUES(?,?,?,?,?,?,?)',(TENANT,channel,conversation_key,chat_seal(context),order_key,order_id,now()))
+                connection.execute('INSERT INTO chat_events VALUES(?,?,?,?,?,?)',(TENANT,channel,event_id,conversation_key,created_at,order_id))
+                return {'duplicate':False,'order_id':order_id,'address_seen':fields.get('address_seen',False),'amount_known':fields.get('gross_revenue') is not None}
+        finally: connection.close()
+
+def chat_orders():
+    rows=q("SELECT id,external_order_id,created_at,source_channel,quantity_dozen,payment_method,gross_revenue,status,amount_source,carrier,tracking_number,cod_settled_amount FROM orders WHERE tenant_id=? AND external_order_id LIKE 'chat:%' ORDER BY id DESC LIMIT 200",(TENANT,))
+    for row in rows: row['needs_review']=row['gross_revenue'] is None or row['payment_method']=='UNKNOWN' or row['quantity_dozen'] is None
+    return rows
+
+def chat_order_detail(order_id):
+    order=q('SELECT * FROM orders WHERE tenant_id=? AND id=?',(TENANT,order_id),one=True)
+    if not order:return None
+    private=q('SELECT * FROM customer_private WHERE tenant_id=? AND customer_key=?',(TENANT,order['customer_key']),one=True)
+    def read(value):
+        if not value:return ''
+        nonce,content=value[:12],value[12:]
+        return bytes(a^b for a,b in zip(content,_ks(len(content),nonce))).decode()
+    return {'order':{k:v for k,v in order.items() if k!='customer_key'},'customer':{k:read(private['enc_'+k]) if private else '' for k in ('name','phone','address')}}
+
+def review_chat_order(order_id,body):
+    order=q('SELECT * FROM orders WHERE tenant_id=? AND id=?',(TENANT,order_id),one=True)
+    if not order:raise ValueError('ไม่พบออเดอร์')
+    patch={}
+    for key in ('gross_revenue','shipping_cost','cod_fee','product_cost','packaging_cost'):
+        if key in body and body[key] not in ('',None):patch[key]=money_number(body[key])
+    if body.get('payment_method'):
+        if body['payment_method'] not in ('PREPAID','COD','UNKNOWN'):raise ValueError('วิธีชำระเงินไม่ถูกต้อง')
+        patch['payment_method']=body['payment_method']
+    if body.get('quantity_dozen') not in ('',None):
+        qty=int(body['quantity_dozen'])
+        if qty<1 or qty>1000:raise ValueError('จำนวนโหลต้องอยู่ระหว่าง 1–1000')
+        patch['quantity_dozen']=qty;patch['quantity_units']=qty*12
+    if 'gross_revenue' in patch:patch['amount_source']='operator'
+    if not patch:return {'ok':True}
+    q('UPDATE orders SET '+','.join(key+'=?' for key in patch)+',updated_at=? WHERE tenant_id=? AND id=?',[*patch.values(),now(),TENANT,order_id],commit=True)
+    audit('operator','order.chat_review',f'order:{order_id}',None,{k:v for k,v in patch.items()})
+    return {'ok':True}
+
+SHIPPING_STATUS={'SHIPPED':'SHIPPED','IN_TRANSIT':'SHIPPED','DELIVERED':'DELIVERED','REFUSED':'REFUSED','RETURNED':'RETURNED','COD_COLLECTED':'COD_COLLECTED'}
+
+def attach_tracking(body):
+    order_id=int(body['order_id']);tracking=str(body.get('tracking_number','')).strip()
+    if not tracking or len(tracking)>100:raise ValueError('กรอกเลขพัสดุ')
+    carrier=str(body.get('carrier','FLASH')).upper()
+    if carrier!='FLASH':raise ValueError('ส่วนเชื่อมต่อนี้เตรียมสำหรับ FLASH')
+    with L:
+        connection=sqlite3.connect(DB,timeout=30)
+        try:
+            with connection:
+                if not connection.execute('SELECT id FROM orders WHERE tenant_id=? AND id=?',(TENANT,order_id)).fetchone():raise ValueError('ไม่พบออเดอร์')
+                other=connection.execute('SELECT id FROM orders WHERE tenant_id=? AND carrier=? AND tracking_number=? AND id<>?',(TENANT,carrier,tracking,order_id)).fetchone()
+                if other:raise ValueError('เลขพัสดุผูกกับออเดอร์อื่นแล้ว')
+                connection.execute('UPDATE orders SET carrier=?,tracking_number=?,updated_at=? WHERE tenant_id=? AND id=?',(carrier,tracking,now(),TENANT,order_id))
+        finally:connection.close()
+    return {'ok':True,'order_id':order_id}
+
+def receive_shipping(body):
+    event_id=str(body.get('event_id','')).strip();tracking=str(body.get('tracking_number','')).strip()
+    raw_status=str(body.get('status','')).upper();carrier=str(body.get('carrier','FLASH')).upper()
+    if not event_id or not tracking or not body.get('event_time') or carrier!='FLASH' or raw_status not in SHIPPING_STATUS:raise ValueError('ต้องมี event_id, tracking_number, carrier=FLASH และ status ตามคู่มือ')
+    event_time=chat_time(body.get('event_time'));status=SHIPPING_STATUS[raw_status]
+    amount=money_number(body['cod_amount']) if status=='COD_COLLECTED' and body.get('cod_amount') is not None else None
+    if status=='COD_COLLECTED' and amount is None:raise ValueError('COD_COLLECTED ต้องระบุ cod_amount ที่ขนส่งโอนจริง')
+    with L:
+        connection=sqlite3.connect(DB,timeout=30);connection.row_factory=sqlite3.Row
+        try:
+            with connection:
+                if connection.execute('SELECT 1 FROM shipping_events WHERE tenant_id=? AND event_id=?',(TENANT,event_id)).fetchone():return {'duplicate':True}
+                order=connection.execute('SELECT * FROM orders WHERE tenant_id=? AND carrier=? AND tracking_number=?',(TENANT,carrier,tracking)).fetchone()
+                if not order:raise ValueError('ยังไม่ผูกเลขพัสดุนี้กับออเดอร์')
+                applied=not order['last_shipping_at'] or event_time>order['last_shipping_at']
+                if order['status'] in ('COD_COLLECTED','CANCELLED','REFUSED','RETURNED') and status!=order['status']:applied=False
+                if order['status']=='DELIVERED' and status=='SHIPPED':applied=False
+                if status=='COD_COLLECTED' and order['payment_method']!='COD':raise ValueError('ออเดอร์นี้ไม่ใช่ COD')
+                if applied:
+                    connection.execute('UPDATE orders SET status=?,last_shipping_at=?,updated_at=? WHERE id=?',(status,event_time,now(),order['id']))
+                    if status=='COD_COLLECTED':connection.execute('UPDATE orders SET cod_settled_amount=?,cod_settled_at=COALESCE(cod_settled_at,?) WHERE id=?',(amount,event_time,order['id']))
+                connection.execute('INSERT INTO shipping_events VALUES(?,?,?,?,?,?,?,?,?)',(TENANT,event_id,order['id'],carrier,tracking,status,event_time,amount,int(applied)))
+                return {'duplicate':False,'order_id':order['id'],'applied':bool(applied),'status':status}
+        finally:connection.close()
+
+def import_shipping_csv(text):
+    import csv,io
+    rows=list(csv.DictReader(io.StringIO(str(text).lstrip('\ufeff'))))
+    if len(rows)>2000:raise ValueError('นำเข้าได้ครั้งละไม่เกิน 2000 แถว')
+    outcomes=[]
+    for number,row in enumerate(rows,2):
+        if not row.get('event_id'):row['event_id']='csv:'+hashlib.sha256(json.dumps(row,sort_keys=True).encode()).hexdigest()
+        try:outcomes.append({'line':number,**receive_shipping(row)})
+        except (ValueError,KeyError):outcomes.append({'line':number,'error':'ตรวจเลขพัสดุ สถานะ วันเวลา และยอด COD ตามคู่มือ'})
+    return {'rows':outcomes,'ok':sum(not row.get('error') for row in outcomes),'failed':sum(bool(row.get('error')) for row in outcomes)}
+
+def integration_status():
+    present=lambda key:bool(env(key))
+    return {'messenger_secret_set':present('META_APP_SECRET'),'verify_token_set':present('WEBHOOK_VERIFY_TOKEN'),
+            'line_secret_set':present('LINE_CHANNEL_SECRET'),'app_token_set':bool(TOKEN),
+            'flash_adapter':'normalized_events_and_csv','flash_live_api_connected':False,
+            'note':'Flash live API ยังต้องใช้เอกสาร/สิทธิ์ API ของบัญชีจริง ไม่เดา URL หรือรหัสสถานะจากขนส่ง'}
+
+def native_chat_events(channel,payload):
+    records=[]
+    if channel=='messenger':
+        if payload.get('object')!='page':raise ValueError('ต้องเป็น Messenger Page webhook')
+        for entry in payload.get('entry',[]):
+            for event in entry.get('messaging',[]):
+                message=event.get('message',{})
+                if not message.get('text') or not message.get('mid'):continue
+                shop=bool(message.get('is_echo'))
+                page_id=str(event.get('sender' if shop else 'recipient',{}).get('id',''))
+                person=str(event.get('recipient' if shop else 'sender',{}).get('id',''))
+                if not page_id or not person:continue
+                referral=event.get('referral') or message.get('referral') or {}
+                records.append({'channel':'messenger','message_id':message['mid'],'conversation_id':page_id+':'+person,
+                                'text':message['text'],'created_at':event.get('timestamp'),'direction':'shop' if shop else 'customer',
+                                'ad_id':referral.get('ad_id')})
+    elif channel=='line':
+        for event in payload.get('events',[]):
+            message=event.get('message',{});source=event.get('source',{})
+            if event.get('type')!='message' or message.get('type')!='text' or source.get('type')!='user':continue
+            event_id=event.get('webhookEventId') or message.get('id');person=source.get('userId')
+            if not event_id or not person:continue
+            records.append({'channel':'line','message_id':event_id,'conversation_id':str(payload.get('destination',''))+':'+person,
+                            'text':message['text'],'created_at':event.get('timestamp')})
+    return [receive_chat(record) for record in records]
+
+def handle_chat_webhook(handler,method,path,query):
+    import base64
+    if path not in ('/webhooks/messenger','/webhooks/line'):return False
+    channel=path.rsplit('/',1)[-1]
+    if method=='GET' and channel=='messenger':
+        expected=env('WEBHOOK_VERIFY_TOKEN')
+        if not expected or query.get('hub.mode')!='subscribe' or not hmac.compare_digest(query.get('hub.verify_token',''),expected):handler.out(403,{'error':'verification failed'});return True
+        handler.out(200,str(query.get('hub.challenge','')).encode(),'text/plain');return True
+    if method!='POST':handler.out(405,{'error':'method not allowed'});return True
+    secret=env('META_APP_SECRET' if channel=='messenger' else 'LINE_CHANNEL_SECRET')
+    if not secret:handler.out(503,{'error':'webhook secret not configured'});return True
+    try:
+        size=int(handler.headers.get('Content-Length') or 0)
+        if size<=0 or size>1048576:raise ValueError('payload size')
+        raw=handler.rfile.read(size)
+        digest=hmac.new(secret.encode(),raw,'sha256').digest()
+        signature=handler.headers.get('X-Hub-Signature-256' if channel=='messenger' else 'X-Line-Signature','')
+        expected='sha256='+digest.hex() if channel=='messenger' else base64.b64encode(digest).decode()
+        if not hmac.compare_digest(signature,expected):handler.out(403,{'error':'invalid signature'});return True
+        results=native_chat_events(channel,json.loads(raw))
+        handler.out(200,{'received':len(results)})
+    except (ValueError,TypeError,KeyError):handler.out(400,{'error':'invalid webhook payload'})
+    except Exception:handler.out(500,{'error':'webhook processing failed'})
+    return True
+
+# ---------------- API ----------------
+TRANS = {"PENDING": ("APPROVED", "REJECTED"), "APPROVED": ("EXECUTED",), "EXECUTED": ("VERIFIED",)}
+def route(m, p, qs, body):
+    days = int(qs.get("days", 7))
+    if m == "GET":
+        if p == "/api/meta/lookalike": return read_lookalikes()
+        if p == "/api/integrations/status": return integration_status()
+        if p == "/api/chat/orders": return chat_orders()
+        if p == "/api/shipping/events": return q('SELECT event_id,order_id,carrier,tracking_number,status,event_time,cod_amount,applied FROM shipping_events WHERE tenant_id=? ORDER BY event_time DESC LIMIT 200',(TENANT,))
+        detail=re.fullmatch(r'/api/chat/orders/(\d+)',p)
+        if detail:return chat_order_detail(int(detail.group(1)))
+        if p == "/api/analytics/dashboard": return agency_dashboard(qs)
+        if p == "/api/analytics/overview": return overview(days)
+        if p == "/api/analytics/segments": return segments(qs.get("dim", "ad"), int(qs.get("days", 30)))
+        if p == "/api/analytics/hourly": return hourly(int(qs.get("days", 30)))
+        if p == "/api/analytics/funnel": return funnel(days)
+        if p == "/api/analytics/cod": return cod(int(qs.get("days", 30)))
+        if p == "/api/analytics/trend": return trend(days)
+        if p == "/api/analytics/compare": return compare(days)
+        if p == "/api/analytics/ads": return ads(days)
+        if p == "/api/analytics/audience": return audience(days)
+        if p == "/api/analytics/reconcile": return reconcile(days)
+        if p == "/api/analytics/adsets": return q("select * from adsets order by name")
+        if p == "/api/orders": return q("select id,external_order_id,created_at,ad_id,region,payment_method,quantity_dozen,gross_revenue,status from orders order by id desc limit 200")  # ไม่มี PII
+        if p == "/api/recommendations": return q("select * from recommendations order by id desc limit 100")
+        if p == "/api/alerts": return q("select * from alert_events order by id desc limit 100")
+        if p == "/api/meta/sync/status": return JOB
+        if p == "/api/settings/store": return store()
+        m_ = re.fullmatch(r"/api/orders/(\d+)", p)
+        if m_: return q("select * from orders where id=?", (m_.group(1),), one=True)
+    if m == "POST":
+        if p == "/api/chat/messages": return receive_chat(body)
+        if p == "/api/shipping/tracking": return attach_tracking(body)
+        if p == "/api/shipping/events": return receive_shipping(body)
+        if p == "/api/shipping/import": return import_shipping_csv(body.get('csv',''))
+        review=re.fullmatch(r'/api/chat/orders/(\d+)/review',p)
+        if review:return review_chat_order(int(review.group(1)),body)
+        if p == "/api/orders": return {"id": create_order(body)}
+        if p == "/api/meta/sync":
+            a, b = dashboard_range({**body, "days":body.get("days",7)})
+            count = (datetime.strptime(b,'%Y-%m-%d')-datetime.strptime(a,'%Y-%m-%d')).days+1
+            return {"started": threading.Thread(target=run_sync,args=(count,a,b),daemon=True).start() is None}
+        m_ = re.fullmatch(r"/api/recommendations/(\d+)/(approve|reject|execute|verify)", p)
+        if m_:
+            r = q("select * from recommendations where id=?", (m_.group(1),), one=True)
+            if not r: return None
+            new = {"approve": "APPROVED", "reject": "REJECTED", "execute": "EXECUTED", "verify": "VERIFIED"}[m_.group(2)]
+            if new not in TRANS.get(r["status"], ()): raise ValueError(f"เปลี่ยน {r['status']} -> {new} ไม่ได้")
+            col = {"APPROVED": "approved_at", "EXECUTED": "executed_at", "VERIFIED": "verified_at"}.get(new)
+            q(f"update recommendations set status=?{','+col+'=?' if col else ''} where id=?", [new] + ([now()] if col else []) + [r["id"]], commit=True)
+            audit(body.get("actor", "operator"), f"recommendation.{new}", f"rec:{r['id']}", {"status": r["status"]}, {"status": new, "note": "v1: ไม่มีการเขียนไป Meta - ผู้ใช้ปรับใน Ads Manager เอง"})
+            return {"ok": True, "status": new}
+    if m == "PATCH":
+        if p == "/api/settings/store":
+            s = {**store(), **body}; q("insert or replace into kv values('store',?)", (json.dumps(s),), commit=True); audit("operator", "settings.store", "store", None, body); return s
+        m_ = re.fullmatch(r"/api/orders/(\d+)", p)
+        if m_: return patch_order(int(m_.group(1)), body)
+    return None
+
+class H(BaseHTTPRequestHandler):
+    def log_message(s, *a): pass
+    def out(s, code, obj, ct="application/json"):
+        b = obj if isinstance(obj, bytes) else json.dumps(obj, ensure_ascii=False, default=str).encode()
+        s.send_response(code); s.send_header("Content-Type", ct + "; charset=utf-8"); s.send_header("Content-Length", str(len(b))); s.end_headers(); s.wfile.write(b)
+    def go(s, m):
+        u = urllib.parse.urlparse(s.path); qs = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+        if handle_chat_webhook(s,m,u.path,qs):return
+        if u.path == "/": return s.out(200, PAGE.encode(), "text/html")
+        if u.path == "/report":
+            if TOKEN and qs.get("t") != TOKEN: return s.out(401, {"error": "unauthorized"})
+            return s.out(200, report(int(qs.get("days", 7))).encode(), "text/html")
+        if TOKEN and not hmac.compare_digest(s.headers.get("X-Token", ""), TOKEN): return s.out(401, {"error": "unauthorized"})
+        if m == 'GET' and u.path == '/api/analytics/dashboard.csv':
+            try: return s.out(200, dashboard_csv(qs), 'text/csv')
+            except (ValueError, KeyError, TypeError) as error: return s.out(400, {'error':str(error)})
+        body = {}
+        if m in ("POST", "PATCH"):
+            try: body = json.loads(s.rfile.read(int(s.headers.get("Content-Length") or 0)) or b"{}")
+            except Exception: return s.out(400, {"error": "bad json"})
+        try:
+            r = route(m, u.path, qs, body); s.out(404 if r is None else 200, {"error": "not found"} if r is None else r)
+        except (ValueError, KeyError, TypeError) as e: s.out(400, {"error": str(e)})
+        except Exception as e: print("ERR", type(e).__name__, e); s.out(500, {"error": "internal"})
+    def do_GET(s): s.go("GET")
+    def do_POST(s): s.go("POST")
+    def do_PATCH(s): s.go("PATCH")
+
+PAGE = r"""<!doctype html><html lang="th"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Meta Buyer Intelligence</title>
+<style>:root{--bg:#f6f7f9;--c:#fff;--t:#1d2433;--m:#6b7280;--b:#e3e6ea;--a:#2563eb}@media(prefers-color-scheme:dark){:root{--bg:#0f1218;--c:#181d27;--t:#e8ebf0;--m:#98a2b3;--b:#2a313d;--a:#6ea0ff}}
+.dashFilters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:15px}input{font:inherit;padding:6px;border:1px solid var(--b);border-radius:6px;background:var(--c);color:var(--t)}@media print{header,.dashFilters,button,select{display:none!important}main{max-width:none;padding:0}.w{overflow:visible;break-inside:avoid}svg{min-width:0!important}body{background:white;color:black}}
+body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--t)}header{padding:12px 16px;background:var(--c);border-bottom:1px solid var(--b);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+h1{font-size:16px;margin:0 12px 0 0}button,select{font:inherit;padding:6px 10px;border:1px solid var(--b);background:var(--c);color:var(--t);border-radius:6px;cursor:pointer}button.on{background:var(--a);color:#fff;border-color:var(--a)}
+main{padding:16px;max-width:1200px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}.k{background:var(--c);border:1px solid var(--b);border-radius:8px;padding:10px}.k b{display:block;font-size:20px;margin-top:4px}.k span{color:var(--m);font-size:12px}
+.w{overflow-x:auto;background:var(--c);border:1px solid var(--b);border-radius:8px;margin-bottom:14px}table{border-collapse:collapse;width:100%}th,td{padding:7px 10px;border-bottom:1px solid var(--b);text-align:left;white-space:nowrap}th{color:var(--m);font-weight:500;font-size:12px}
+.tag{padding:2px 7px;border-radius:10px;background:var(--b);font-size:12px}.U{background:#dc2626;color:#fff}.A{background:#f59e0b;color:#000}textarea{width:100%;height:300px;font:12px monospace;background:var(--c);color:var(--t);border:1px solid var(--b)}.bar{background:var(--a);height:14px;border-radius:3px}</style>
+<header><h1>Meta Buyer Intelligence</h1><span id=nav></span><span style="flex:1"></span><span id=mode class=tag></span><button onclick="rep()">รายงานลูกค้า</button> <button onclick="sync()">Sync</button></header><main id=v></main>
+<script>
+let T=localStorage.t||"";const e=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+async function api(p,o={}){const r=await fetch("/api"+p,{method:o.method||"GET",headers:{"X-Token":T,"Content-Type":"application/json"},body:o.body&&JSON.stringify(o.body)});if(r.status==401){T=prompt("APP_TOKEN")||"";localStorage.t=T;return api(p,o)}return r.json()}
+const f=(n,d=0)=>n==null?"-":Number(n).toLocaleString("th-TH",{maximumFractionDigits:d});
+const tbl=(h,r)=>'<div class=w><table><tr>'+h.map(x=>"<th>"+x+"</th>").join("")+"</tr>"+r.map(x=>"<tr>"+x.map(y=>"<td>"+y+"</td>").join("")+"</tr>").join("")+"</table></div>";
+const kp=(l,v)=>`<div class=k><span>${l}</span><b>${v}</b></div>`;let cur="dashboard",days=7,dim="ad",met="orders";
+const dsel=()=>`<p>ช่วง:<select onchange="days=+this.value;go()">${[1,7,30].map(d=>`<option ${d==days?"selected":""} value=${d}>${d} วัน</option>`).join("")}</select></p>`;
+const gl=s=>String(s).replace("female","หญิง").replace("male","ชาย").replace("unknown","ไม่ระบุ"),pc=x=>x==null?"-":f(x*100,2)+"%",dl=x=>x==null?"":(x>0?"▲":"▼")+f(Math.abs(x),1)+"%";
+const V={
+ads:async()=>{const [c,t,a]=await Promise.all([api("/analytics/compare?days="+days),api("/analytics/trend?days=14"),api("/analytics/ads?days="+days)]);const L={spend:["ค่าใช้จ่าย",0],messages:["ข้อความ",0],cost_per_message:["ต้นทุน/ข้อความ",1],ctr:["CTR ลิงก์",0],cpm:["CPM",1],impressions:["การแสดงผล",0]},mx=Math.max(1,...t.map(x=>x.msgs));
+return dsel()+`<div class=g>${Object.keys(L).map(k=>kp(L[k][0]+" <small>"+dl(c[k].delta)+" เทียบช่วงก่อน</small>",k=="ctr"?pc(c[k].cur):f(c[k].cur,L[k][1]))).join("")}</div><h3>แนวโน้มรายวัน (14 วัน)</h3>`+tbl(["วันที่","ใช้จ่าย","ข้อความ","ต้นทุน/ข้อความ",""],t.map(x=>[x.date,f(x.spend),x.msgs,f(x.msgs?x.spend/x.msgs:null,1),`<div class=bar style="width:${x.msgs/mx*200}px"></div>`]))+"<h3>รายโฆษณา</h3>"+tbl(["โฆษณา","ใช้จ่าย","แสดงผล","คลิกลิงก์","CTR","ข้อความ","ต้นทุน/ข้อความ","ข้อมูล"],a.map(x=>[e(x.name),f(x.spend),f(x.imp),f(x.lc),pc(x.ctr),x.msgs,f(x.cpmsg,1),x.enough?"พอ":"น้อย"]))},
+audience:async()=>{const [r,k,s]=await Promise.all([api("/analytics/audience?days="+days),api("/analytics/reconcile?days="+days),api("/analytics/adsets")]);const T={age_gender:"อายุ × เพศ",region:"พื้นที่",delivery:"ตำแหน่งโฆษณา",device:"อุปกรณ์"};
+let h=dsel()+"<p><small>ข้อมูลกลุ่มผู้ชมจาก Meta แสดงต้นทุนต่อข้อความ ไม่ใช่ยอดขาย (Meta ไม่ส่งออเดอร์แยกตามอายุ/เพศ) · 'คุ้ม' = ต้นทุนต่ำกว่าค่าเฉลี่ยบัญชี ≥20% และมีข้อความถึงเกณฑ์</small></p><h3>การตั้งค่ากลุ่มเป้าหมายของชุดโฆษณา</h3>";
+h+=s.length?tbl(["ชุดโฆษณา","สถานะ","งบ/วัน","เป้าหมาย","กลุ่มเป้าหมาย"],s.map(x=>[e(x.name),x.status,f(x.budget),e(x.goal),e(x.targeting)])):"<p><small>ยังไม่มีข้อมูล (กด Sync)</small></p>";
+for(const g in T)h+=`<h3>${T[g]}</h3>`+(r[g].length?tbl(["กลุ่ม","ใช้จ่าย","สัดส่วน","แสดงผล","CTR","ข้อความ","ต้นทุน/ข้อความ","ประเมิน"],r[g].map(x=>[e(gl(x.seg)),f(x.spend),f(x.share*100,1)+"%",f(x.imp),pc(x.ctr),x.msgs,f(x.cpmsg,1),`<span class=tag>${x.verdict}</span>`])):"<p><small>ยังไม่มีข้อมูลส่วนนี้ (อาจยังไม่ได้ Sync หรือ Meta ไม่ส่งมา)</small></p>");
+return h+"<h3>ตรวจความถูกต้องของข้อมูล</h3>"+tbl(["ชุดข้อมูล","ค่าใช้จ่ายรวม","ต่างจากยอดรวมบัญชี","ผล"],k.checks.map(c=>[T[c.grain]||"รายชั่วโมง",c.loaded?f(c.spend):"-",c.diff_pct==null?"-":f(c.diff_pct,2)+"%",!c.loaded?"ยังไม่มีข้อมูล":c.diff_pct<3?"✓ ตรง":"✗ ต่างเกิน 3%"]))},
+overview:async()=>{const o=await api("/analytics/overview?days="+days);return`<p>ช่วง:<select onchange="days=+this.value;go()">${[1,7,30].map(d=>`<option ${d==days?"selected":""} value=${d}>${d} วัน</option>`).join("")}</select></p><div class=g>${kp("Spend",f(o.spend))+kp("Messages",f(o.messages))+kp("Orders",f(o.orders))+kp("Revenue",f(o.revenue))+kp("CPA (เป้า "+o.target_cpa+")",f(o.cpa,1))+kp("ROAS",f(o.roas,2))+kp("Contribution หลังค่าแอด",f(o.contribution_after_ads))+kp("Close rate",o.close_rate==null?"-":f(o.close_rate*100,1)+"%")+kp("คำแนะนำรออนุมัติ",o.open_recommendations)}</div><h3>แจ้งเตือนล่าสุด</h3>`+tbl(["เวลา","ระดับ","เรื่อง"],o.recent_alerts.map(a=>[a.created_at,`<span class="tag ${a.severity[0]}">${a.severity}</span>`,e(a.title)]))},
+segments:async()=>{const r=await api("/analytics/segments?dim="+dim);return`<p>มิติ:<select onchange="dim=this.value;go()">${["ad","region","hour"].map(d=>`<option ${d==dim?"selected":""}>${d}</option>`).join("")}</select> <small>Segment Purchase Propensity Score (ไม่ใช่การประเมินกำลังซื้อรายบุคคล) · age/placement ไม่มี order mapping จึงไม่ให้คะแนน</small></p>`+tbl(["Segment","Spend","Msgs","Orders","Close%","CPA","Revenue","Score","Confidence","Action","เหตุผล"],r.map(x=>[e(x.segment),f(x.spend),x.messages,x.orders,x.close_rate==null?"-":f(x.close_rate*100,1),f(x.cpa),f(x.revenue),`<b>${x.buyer_score}</b>`,`<div class=bar style="width:${x.confidence*80}px"></div>${x.confidence}`,`<span class=tag>${x.action}</span>`,e(x.why.join(", "))]))},
+hourly:async()=>{const c=await api("/analytics/hourly"),D=["จ","อ","พ","พฤ","ศ","ส","อา"];const val=x=>!x?0:met=="cpa"?(x.orders?x.spend/x.orders:0):x[met];let mx=1;for(const k in c)mx=Math.max(mx,val(c[k]));let h='<tr><th></th>'+[...Array(24).keys()].map(i=>"<th>"+i+"</th>").join("")+"</tr>";for(let w=0;w<7;w++){h+=`<tr><th>${D[w]}</th>`;for(let i=0;i<24;i++){const v=val(c[w+"-"+i]);h+=`<td style="padding:4px;text-align:center;background:rgba(37,99,235,${v/mx*.9})" title="${f(v,1)}">${v?f(v):""}</td>`}h+="</tr>"}return`<p>Metric:<select onchange="met=this.value;go()">${["orders","msgs","spend","cpa"].map(d=>`<option ${d==met?"selected":""}>${d}</option>`).join("")}</select> (เวลาตาม timezone ผู้ลงโฆษณา)</p><div class=w><table>${h}</table></div>`},
+funnel:async()=>{const r=await api("/analytics/funnel?days="+days),m=r[0][1]||1;return tbl(["ขั้น","จำนวน","% ของ Impression",""],r.map(x=>[x[0],f(x[1]),f(x[1]/m*100,2)+"%",`<div class=bar style="width:${Math.max(2,Math.log10(x[1]+1)/Math.log10(m+1)*300)}px"></div>`]))},
+cod:async()=>{const c=await api("/analytics/cod");return`<div class=g>${kp("COD orders",c.cod_orders)+kp("เก็บเงินได้",c.collected)+kp("ปฏิเสธรับ",c.refused)+kp("ตีกลับ",c.returned)+kp("Refusal rate",c.refusal_rate==null?"-":f(c.refusal_rate*100,1)+"%")+kp("ประเมินความเสียหาย",f(c.loss_estimate))}</div>`},
+recs:async()=>{const r=await api("/recommendations"),nx={PENDING:["approve","reject"],APPROVED:["execute"],EXECUTED:["verify"]};return"<p><small>v1: ระบบไม่เขียนไป Meta เอง — กด Execute หลังคุณปรับใน Ads Manager แล้ว จากนั้น Verify</small></p>"+tbl(["เวลา","ระดับ","ประเภท","เป้าหมาย","หลักฐาน","คำแนะนำ","สถานะ",""],r.map(x=>[x.created_at,x.severity,x.type,e(x.entity),e(x.evidence),e(JSON.parse(x.recommendation).action),x.status,(nx[x.status]||[]).map(a=>`<button onclick="act(${x.id},'${a}')">${a}</button>`).join(" ")]))},
+orders:async()=>{const r=await api("/orders");return tbl(["#","เวลา","Ad","จังหวัด","ชำระ","โหล","ยอด","สถานะ"],r.map(x=>[x.id,x.created_at,e(x.ad_id),e(x.region),x.payment_method,x.quantity_dozen,f(x.gross_revenue),x.status]))+"<small>เพิ่ม/แก้ order ผ่าน POST/PATCH /api/orders — ข้อมูลส่วนตัวถูกแยกเก็บและเข้ารหัส ไม่แสดงที่นี่</small>"},
+alerts:async()=>{const r=await api("/alerts");return tbl(["เวลา","ระดับ","เรื่อง","รายละเอียด"],r.map(x=>[x.created_at,`<span class="tag ${x.severity[0]}">${x.severity}</span>`,e(x.title),e(x.payload)]))},
+settings:async()=>{const s=await api("/settings/store");return`<p>Store config (ราคา แพ็ก ต้นทุน เกณฑ์ alert)</p><textarea id=cfg>${e(JSON.stringify(s,null,2))}</textarea><br><button onclick="saveCfg()">บันทึก</button>`}};
+// Agency dashboard: no new tokens, chart libraries, or external scripts.
+let dashSince='',dashUntil='',dashCampaign='',dashDimension='campaign',dashMetric='spend',dashCache=null,dashCompare=true;
+const dashMetrics={spend:['ค่าโฆษณา','เงิน'],impressions:['การแสดงผล','ครั้ง'],clicks:['คลิกทั้งหมด','ครั้ง'],link_clicks:['คลิกลิงก์','ครั้ง'],messages:['ข้อความเริ่มสนทนา','ครั้ง'],orders:['ออเดอร์ยืนยัน','ออเดอร์'],paid_orders:['ออเดอร์ชำระ/ส่งสำเร็จ','ออเดอร์'],revenue:['ยอดขายจริง','เงิน'],cpa:['ต้นทุนต่อออเดอร์','เงิน'],roas:['ROAS จากออเดอร์จริง','เท่า'],ctr:['CTR คลิกทั้งหมด','%'],link_ctr:['CTR ลิงก์','%'],cpc:['CPC','เงิน'],cpm:['CPM','เงิน'],cost_per_message:['ต้นทุนต่อข้อความ','เงิน'],close_rate:['อัตราปิดการขาย','%'],contribution:['เหลือหลังต้นทุนและแอด','เงิน'],cod_orders:['ออเดอร์ COD','ออเดอร์'],cod_refused:['COD ปฏิเสธ','ออเดอร์'],cod_refusal_rate:['อัตรา COD ปฏิเสธ','%'],meta_purchases:['Purchase ที่ Meta รายงาน','ครั้ง'],meta_purchase_value:['มูลค่า Purchase ที่ Meta รายงาน','เงิน']};
+const dashDims={campaign:'แคมเปญ',ad:'โฆษณา',age_gender:'อายุ–เพศ',region:'พื้นที่',delivery:'ตำแหน่งโฆษณา',device:'อุปกรณ์',hourly:'ชั่วโมง'};
+const dashAdMetrics=new Set(['spend','impressions','clicks','link_clicks','messages','meta_purchases','meta_purchase_value','cpa','roas','ctr','link_ctr','cpc','cpm','cost_per_message','close_rate','contribution']);
+const dashValue=(row,key)=>dashAdMetrics.has(key)&&!row.has_ads?null:row[key];
+function dashLine(data,key,previous=[]){
+ const W=1040,H=330,L=85,R=980,TOP=30,B=275,values=[...data,...previous].map(r=>dashValue(r,key)).filter(x=>x!=null),meta=dashMetrics[key];
+ if(!values.length)return '<div class=k>ยังไม่มีข้อมูลสำหรับกราฟนี้</div>';
+ let low=Math.min(0,...values),high=Math.max(0,...values);if(high==low)high=low+1;
+ const xx=i=>L+(R-L)*i/Math.max(data.length-1,1),yy=y=>B-(y-low)/(high-low)*(B-TOP);
+ let svg=`<svg id=dashLine role=img aria-label="${e(meta[0])}" viewBox="0 0 ${W} ${H}" style="width:100%;min-width:520px"><title>${e(meta[0])} รายวัน</title>`;
+ for(let i=0;i<5;i++){let y=TOP+(B-TOP)*i/4;svg+=`<line x1=${L} x2=${R} y1=${y} y2=${y} stroke="var(--b)"/><text x=${L-10} y=${y+4} text-anchor=end fill="var(--m)" font-size=12>${f(high-(high-low)*i/4,2)}</text>`}
+ const draw=(rows,color,dashed)=>{let result='',points=[];const flush=()=>{if(points.length>1)result+=`<polyline points="${points.join(' ')}" fill=none stroke="${color}" stroke-width=2.5 ${dashed?'stroke-dasharray="6 5"':''}/>`;points=[]};
+ rows.forEach((r,i)=>{const val=dashValue(r,key);if(val==null){flush();return}const x=xx(i),y=yy(val);points.push(`${x},${y}`);result+=`<circle cx=${x} cy=${y} r=4 fill="${color}"><title>${e(r.date)} · ${e(meta[0])}: ${f(val,2)} ${e(meta[1]=='เงิน'?dashCache.currency:meta[1])}</title></circle>`});flush();return result};
+ if(previous.length)svg+=draw(previous,'#f59e0b',true);svg+=draw(data,'#2563eb',false);
+ [...new Set([0,Math.floor((data.length-1)/2),data.length-1])].forEach(i=>svg+=`<text x=${xx(i)} y=${B+25} text-anchor=middle fill="var(--m)" font-size=12>${e(data[i].date)}</text>`);
+ return svg+'</svg>';
+}
+function dashBars(rows){
+ if(!rows.length)return '<p>ยังไม่มีข้อมูลมิตินี้ในช่วงที่เลือก</p>';
+ const list=rows.slice(0,12),max=Math.max(1,...list.map(r=>r.spend)),height=35*list.length+30;
+ let h=`<svg role=img aria-label="ค่าโฆษณาแต่ละกลุ่ม" viewBox="0 0 1040 ${height}" style="width:100%;min-width:520px"><title>ค่าโฆษณาแยกกลุ่ม สูงสุด 12 กลุ่ม</title>`;
+ list.forEach((r,i)=>{let y=25+i*35;h+=`<text x=240 y=${y+13} text-anchor=end font-size=12 fill="var(--t)">${e(String(r.label).slice(0,30))}</text><rect x=255 y=${y} width=${r.spend/max*625} height=20 fill="#2563eb"><title>${e(r.label)} · ${f(r.spend,2)} ${e(dashCache.currency)}</title></rect><text x=${265+r.spend/max*625} y=${y+14} font-size=12 fill="var(--m)">${f(r.spend,2)}</text>`});return h+'</svg>';
+}
+function dashParams(){const p=new URLSearchParams({days:days,dimension:dashDimension});if(dashSince)p.set('since',dashSince);if(dashUntil)p.set('until',dashUntil);if(dashCampaign)p.set('campaign',dashCampaign);return p.toString()}
+function dashApply(){dashSince=document.getElementById('dashSince').value;dashUntil=document.getElementById('dashUntil').value;dashCampaign=document.getElementById('dashCampaign').value;dashDimension=document.getElementById('dashDimension').value;go()}
+function dashPreset(n){days=n;dashSince='';dashUntil='';go()}
+function dashChooseMetric(value){dashMetric=value;go()}
+async function dashExport(){try{let r=await fetch('/api/analytics/dashboard.csv?'+dashParams(),{headers:{'X-Token':T}});if(r.status===401){await api('/meta/sync/status');return dashExport()}if(!r.ok)throw Error('ส่งออกไม่สำเร็จ');const blob=await r.blob();dashDownload(blob,`agency_dashboard_${dashCache.since}_${dashCache.until}.csv`)}catch(error){alert(error.message)}}
+function dashDownload(blob,name){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}
+function dashSvg(){const svg=document.getElementById('dashLine');if(!svg)return;const copy=svg.cloneNode(true);copy.setAttribute('xmlns','http://www.w3.org/2000/svg');copy.querySelectorAll('[fill]').forEach(x=>{if(x.getAttribute('fill').startsWith('var('))x.setAttribute('fill','#475569')});copy.querySelectorAll('[stroke]').forEach(x=>{if(x.getAttribute('stroke').startsWith('var('))x.setAttribute('stroke','#cbd5e1')});dashDownload(new Blob([copy.outerHTML],{type:'image/svg+xml'}),`agency_chart_${dashMetric}.svg`)}
+V.dashboard=async()=>{
+ const r=await api('/analytics/dashboard?'+dashParams());if(r.error)throw Error(r.error);dashCache=r;
+ const opts=(obj,selected)=>Object.entries(obj).map(([key,label])=>`<option value="${e(key)}" ${key===selected?'selected':''}>${e(Array.isArray(label)?label[0]:label)}</option>`).join('');
+ const cards=['spend','messages','orders','revenue','cpa','roas','contribution','cod_refusal_rate'].map(k=>{let c=r.compare[k],delta=c.delta==null?'ไม่มีฐานเปรียบเทียบ':`${c.delta>=0?'+':''}${f(c.delta,1)}% เทียบช่วงก่อน`;return kp(`${e(dashMetrics[k][0])} <small>${delta}</small>`,f(c.cur,2)+(dashMetrics[k][1]=='%'?'%':''))}).join('');
+ let html=`<h2>${e(r.agency_name||'แดชบอร์ดงานโฆษณา')}${r.client_name?' · '+e(r.client_name):''}</h2><p>ช่วง ${e(r.since)} ถึง ${e(r.until)} · หน่วยเงิน ${e(r.currency)} · ${e(r.mode)} · Sync ล่าสุด ${e(r.last_sync||'ยังไม่มี')}</p><div class="dashFilters"><label>จาก <input id=dashSince type=date value="${e(r.since)}"></label><label>ถึง <input id=dashUntil type=date value="${e(r.until)}"></label><label>แคมเปญ <select id=dashCampaign><option value="">ทุกแคมเปญในบัญชีนี้</option>${r.campaigns.map(c=>`<option value="${e(c.campaign_id)}" ${dashCampaign===c.campaign_id?'selected':''}>${e(c.name||c.campaign_id)}</option>`).join('')}</select></label><button onclick="dashApply()">แสดงข้อมูล</button>${[7,30,90].map(n=>`<button onclick="dashPreset(${n})">${n} วัน</button>`).join('')}<button onclick="dashExport()">ดาวน์โหลด CSV</button><button onclick="window.print()">พิมพ์ / PDF</button></div>`;
+ html+=`<div class=g>${cards}</div><p><small>กราฟมีข้อมูลแอด ${r.ad_days}/${r.daily.length} วัน · ออเดอร์ยืนยันและยอดขายจริงแยกจาก Purchase ที่ Meta รายงาน · เหลือหลังต้นทุนยังไม่รวมเงินเดือน ภาษี และค่าใช้จ่ายบริษัท</small></p>`;
+ if(r.warnings.length)html+=`<div class=k>${r.warnings.map(w=>'<p>⚠ '+e(w)+'</p>').join('')}</div>`;
+ html+=`<h3>กราฟแนวโน้มรายวัน</h3><p><select aria-label="ตัวชี้วัดกราฟ" onchange="dashChooseMetric(this.value)">${opts(dashMetrics,dashMetric)}</select> <label><input type=checkbox ${dashCompare?'checked':''} onchange="dashCompare=this.checked;go()"> เทียบช่วงก่อน</label> <button onclick="dashSvg()">ดาวน์โหลดกราฟ SVG</button></p><p><small>สีน้ำเงิน = ช่วงนี้ · เส้นประสีส้ม = ${e(r.previous_since)} ถึง ${e(r.previous_until)} เทียบตามลำดับวัน · ชี้จุดเพื่อดูตัวเลข · ช่องว่าง = ยังไม่มีข้อมูลแอดหรือไม่มีฐานคำนวณ</small></p><div class=w>${dashLine(r.daily,dashMetric,dashCompare?r.previous_daily:[])}</div>`;
+ html+=`<h3>วิเคราะห์แยกกลุ่ม</h3><p><select id=dashDimension onchange="dashApply()">${opts(dashDims,dashDimension)}</select> · ใช้ยอดของมิตินี้เท่านั้น ไม่รวมข้ามชุดข้อมูล</p><div class=w>${dashBars(r.groups)}</div>`;
+ html+=tbl(['กลุ่ม','ค่าแอด','การแสดงผล','คลิก','ข้อความ','CTR %','ต้นทุน/ข้อความ'],r.groups.map(x=>[e(x.label),f(x.spend,2),f(x.impressions),f(x.clicks),f(x.messages),f(x.ctr,2),f(x.cost_per_message,2)]));
+ html+='<h3>ข้อมูลรายวัน</h3>'+tbl(['วันที่','ข้อมูลแอด','ค่าแอด','ข้อความ','ออเดอร์ยืนยัน','ยอดขายจริง','Purchase Meta','CPA','ROAS','เหลือหลังต้นทุน'],r.daily.map(x=>[e(x.date),x.has_ads?'มี':'ยังไม่มี',x.has_ads?f(x.spend,2):'—',x.has_ads?f(x.messages):'—',f(x.orders),f(x.revenue,2),x.has_ads?f(x.meta_purchases):'—',f(dashValue(x,'cpa'),2),f(dashValue(x,'roas'),2),f(dashValue(x,'contribution'),2)]));
+ return html;
+};
+
+// Chat and Flash Express workflows; authentication continues through existing api()/APP_TOKEN.
+function chatResult(message){document.getElementById('chatResult').textContent=message}
+V.chat=async()=>{const [rows,status]=await Promise.all([api('/chat/orders'),api('/integrations/status')]);if(rows.error)throw Error(rows.error);
+return `<h2>รับออเดอร์จากแชต</h2><p>ลูกค้าส่งที่อยู่ = ออเดอร์ยืนยัน · ยอดเงินและวิธีชำระที่ยังไม่ทราบจะแสดงว่า “ต้องเติมข้อมูล” · ส่งที่อยู่แก้ไขในแชตเดิมไม่สร้างออเดอร์ซ้ำ</p><div class=k><h3>ทดสอบ / นำเข้าข้อความแชต</h3><p>หลังเชื่อม Webhook ข้อความใหม่จะเข้าระบบอัตโนมัติ แบบฟอร์มนี้ใช้ทดสอบหรือวางข้อความก่อนเชื่อมจริง</p><div class=dashFilters><label>ช่องทาง <select id=chatChannel><option value=manual>วางข้อความเอง</option><option value=messenger>Messenger</option><option value=line>LINE OA</option></select></label><label>รหัสแชต <input id=chatConversation placeholder="เช่น CHAT-001"></label><label>ผู้ส่ง <select id=chatDirection><option value=customer>ลูกค้า</option><option value=shop>ร้าน (ราคาที่แจ้งลูกค้า)</option></select></label><label><input id=chatNew type=checkbox> เริ่มออเดอร์ใหม่ในแชตเดิม</label></div><textarea id=chatText style="height:140px" placeholder="วางข้อความจริง เช่น จำนวน 2 โหล COD ยอดรวม 375 บาท\nชื่อผู้รับ: ลูกค้าทดสอบ\nโทร 0890000000\nบ้านเลขที่ 123/45 แขวงทดสอบ เขตทดสอบ กรุงเทพ 10110"></textarea><p><button onclick="chatSend()">รับข้อความและบันทึกออเดอร์</button></p><p id=chatResult role=status></p></div><h3>ออเดอร์จากข้อความที่ส่งที่อยู่</h3>`+tbl(['#','วันที่','ช่องทาง','โหล','ชำระ','ยอดรวม','สถานะ','ที่มาราคา','พัสดุ',''],rows.map(r=>[r.id,e(r.created_at),e(r.source_channel),f(r.quantity_dozen),e(r.payment_method),r.gross_revenue==null?'ต้องเติมยอด':f(r.gross_revenue,2),e(r.status),e(r.amount_source||'ยังไม่ทราบ'),e(r.tracking_number||''),`<button onclick="chatEdit(${r.id})">รายละเอียด / เติมยอด</button>`]))+`<div id=chatDetail></div><h3>สถานะเชื่อมแชต</h3><p>Messenger App Secret: ${status.messenger_secret_set?'ตั้งค่าแล้ว':'ยังไม่ตั้งค่า'} · Verify Token: ${status.verify_token_set?'ตั้งค่าแล้ว':'ยังไม่ตั้งค่า'} · LINE Channel Secret: ${status.line_secret_set?'ตั้งค่าแล้ว':'ยังไม่ตั้งค่า'}</p><p>ยังต้องตั้ง Callback HTTPS และสมัครรับข้อความที่ Meta/LINE เพื่อรับจริง การมีโทเค็นยิงแอดอย่างเดียวไม่ได้เปิดสิทธิ์อ่านข้อความ</p>`};
+async function chatSend(){try{const conversation=document.getElementById('chatConversation').value.trim(),text=document.getElementById('chatText').value.trim();if(!conversation||!text)throw Error('กรอกรหัสแชตและข้อความ');const r=await api('/chat/messages',{method:'POST',body:{channel:document.getElementById('chatChannel').value,conversation_id:conversation,message_id:'manual-'+Date.now()+'-'+Math.random().toString(36).slice(2),text:text,direction:document.getElementById('chatDirection').value,new_order:document.getElementById('chatNew').checked}});if(r.error)throw Error(r.error);const savedConversation=conversation,savedChannel=document.getElementById('chatChannel').value;await go();document.getElementById('chatConversation').value=savedConversation;document.getElementById('chatChannel').value=savedChannel;chatResult(r.order_id?`บันทึกออเดอร์ #${r.order_id} แล้ว${r.amount_known?'':' — ต้องเติมยอดเงิน'}`:'รับข้อความแล้ว รอที่อยู่จากลูกค้าเพื่อยืนยันออเดอร์')}catch(error){chatResult(error.message)}}
+async function chatEdit(id){const r=await api('/chat/orders/'+id);if(r.error){alert(r.error);return}const o=r.order,c=r.customer;
+document.getElementById('chatDetail').innerHTML=`<div class=k><h3>ออเดอร์ #${id}</h3><p>ผู้รับ: ${e(c.name||'ยังไม่ระบุ')} · โทร: ${e(c.phone||'ยังไม่ระบุ')}</p><pre style="white-space:pre-wrap">${e(c.address||'ยังไม่ระบุ')}</pre><div class=dashFilters><label>จำนวนโหล <input id=editQty type=number min=1 value="${e(o.quantity_dozen??'')}"></label><label>ชำระ <select id=editPayment>${['UNKNOWN','PREPAID','COD'].map(p=>`<option ${o.payment_method===p?'selected':''}>${p}</option>`).join('')}</select></label><label>ยอดเงินรวม <input id=editTotal type=number min=0 step=.01 value="${e(o.gross_revenue??'')}"></label><button onclick="chatSave(${id})">บันทึก</button></div><div class=dashFilters>${['shipping_cost','cod_fee','product_cost','packaging_cost'].map((k,i)=>`<label>${['ค่าส่ง','ค่าธรรมเนียม COD','ต้นทุนสินค้า','ค่าบรรจุ'][i]} <input id=edit_${k} type=number min=0 step=.01 value="${e(o[k]??'')}"></label>`).join('')}</div><p id=editResult role=status></p></div>`}
+async function chatSave(id){const body={quantity_dozen:document.getElementById('editQty').value,payment_method:document.getElementById('editPayment').value,gross_revenue:document.getElementById('editTotal').value};for(const k of ['shipping_cost','cod_fee','product_cost','packaging_cost'])body[k]=document.getElementById('edit_'+k).value;const r=await api('/chat/orders/'+id+'/review',{method:'POST',body:body});if(r.error){document.getElementById('editResult').textContent=r.error;return}await go();await chatEdit(id);document.getElementById('editResult').textContent='บันทึกแล้ว — กราฟใช้ยอดที่แก้ไขนี้'}
+V.shipping=async()=>{const [events,status,orders]=await Promise.all([api('/shipping/events'),api('/integrations/status'),api('/orders')]);return `<h2>Flash Express</h2><p>ผูกเลขพัสดุที่สร้างใน Flash กับออเดอร์ แล้วรับสถานะจาก CSV หรือระบบเชื่อมต่อ API/Webhook ที่แปลงเป็นรูปแบบของโปรแกรม</p><p><b>สถานะ: ยังไม่ได้เชื่อม API Flash จริง</b> ต้องเปิดสิทธิ์ API และใช้เอกสารสำหรับบัญชีที่ลงทะเบียนก่อน ตัวโปรแกรมยังไม่จองพัสดุหรือคิดค่าส่งจาก Flash อัตโนมัติ</p><div class=k><h3>ผูกเลขพัสดุ</h3><div class=dashFilters><label>ออเดอร์ <select id=shipOrder>${orders.map(o=>`<option value=${o.id}>#${o.id} · ${e(o.status)} · ${f(o.gross_revenue,2)}</option>`).join('')}</select></label><label>เลขพัสดุ Flash <input id=shipTracking></label><button onclick="shipAttach()">บันทึกเลขพัสดุ</button></div><p id=shipResult role=status></p></div><div class=k><h3>นำเข้าสถานะ CSV</h3><p>หัวตาราง: tracking_number,status,event_time,cod_amount,event_id · สถานะที่รองรับ: SHIPPED, IN_TRANSIT, DELIVERED, REFUSED, RETURNED, COD_COLLECTED</p><p>DELIVERED คือส่งถึงผู้รับ ส่วน COD_COLLECTED ต้องมียอดที่ Flash โอนจริง ห้ามใช้วันส่งสำเร็จแทนวันรับเงิน</p><input id=shippingFile type=file accept=".csv,text/csv"><button onclick="shipImport()">นำเข้าไฟล์</button><p id=shippingImportResult role=status></p></div><h3>ประวัติพัสดุ</h3>`+tbl(['ออเดอร์','เลขพัสดุ','สถานะ','เวลา','ยอด COD','อัปเดต'],events.map(r=>[r.order_id,e(r.tracking_number),e(r.status),e(r.event_time),f(r.cod_amount,2),r.applied?'ใช้แล้ว':'ไม่ใช้ (เก่าหรือไม่ตรงลำดับ)']))};
+async function shipAttach(){const r=await api('/shipping/tracking',{method:'POST',body:{order_id:document.getElementById('shipOrder').value,carrier:'FLASH',tracking_number:document.getElementById('shipTracking').value}});document.getElementById('shipResult').textContent=r.error||'ผูกเลขพัสดุแล้ว'}
+async function shipImport(){const file=document.getElementById('shippingFile').files[0];if(!file){document.getElementById('shippingImportResult').textContent='เลือกไฟล์ CSV ก่อน';return}const r=await api('/shipping/import',{method:'POST',body:{csv:await file.text()}});document.getElementById('shippingImportResult').textContent=r.error||`นำเข้า ${r.ok} แถว · ไม่สำเร็จ ${r.failed} แถว `+r.rows.filter(x=>x.error).map(x=>`แถว ${x.line}: ${x.error}`).join('; ')}
+V.lookalike=async()=>{const r=await api('/meta/lookalike');return '<h2>Lookalike Audience</h2><p>อ่านกลุ่มที่มีอยู่ในบัญชีเดิม ไม่สร้างหรือแก้โฆษณา และไม่แสดงรายชื่อบุคคล</p><p>'+e(r.note||r.error||'')+'</p>'+tbl(['ชื่อ','ID','ประเภท','ประเทศ / เปอร์เซ็นต์ / กลุ่มต้นทาง'],(r.rows||[]).map(x=>[e(x.name),e(x.id),e(x.subtype),e(JSON.stringify(x.lookalike_spec||{}))]))};
+Object.assign(dashMetrics,{address_orders:['ออเดอร์ที่ส่งที่อยู่','ออเดอร์'],address_revenue:['ยอดสั่งซื้อจากแชต','เงิน'],unpriced_orders:['ออเดอร์ยังไม่ทราบยอด','ออเดอร์'],paid_revenue:['ยอดออเดอร์ที่รับเงินแล้ว (ตามวันที่สั่ง)','เงิน'],cod_settled:['เงิน COD รับจริงตามวันโอน','เงิน']});
+
+const N={chat:"รับออเดอร์จากแชต",shipping:"Flash Express",lookalike:"Lookalike",dashboard:"แดชบอร์ดกราฟ",overview:"ภาพรวม",ads:"ผลโฆษณา",audience:"กลุ่มผู้ชม",segments:"กลุ่มเป้าหมาย",hourly:"เวลา",funnel:"Funnel",cod:"COD",recs:"คำแนะนำ",orders:"ออเดอร์",alerts:"แจ้งเตือน",settings:"ตั้งค่า"};
+nav.innerHTML=Object.keys(N).map(k=>`<button id=b_${k} onclick="cur='${k}';go()">${N[k]}</button>`).join(" ");
+let renderGeneration=0;
+async function go(){const generation=++renderGeneration;for(const k in N)document.getElementById("b_"+k).className=k==cur?"on":"";try{const html=await V[cur]();if(generation!==renderGeneration)return;v.innerHTML=html;const s=await api("/meta/sync/status");mode.textContent=s.mode+(s.running?" · syncing":"")+(s.error?" · error":"")+(s.warn&&s.warn.length?" · warn":"")}catch(error){if(generation===renderGeneration)v.innerHTML='<div class=k>'+e(error.message)+'</div>'}}
+async function act(id,a){const r=await api(`/recommendations/${id}/${a}`,{method:"POST",body:{}});if(r.error)alert(r.error);go()}
+function rep(){open("/report?days="+days+"&t="+encodeURIComponent(T))}
+async function sync(){const body={days:days};if(cur==='dashboard'&&dashCache){body.since=dashCache.since;body.until=dashCache.until}await api("/meta/sync",{method:"POST",body:body});setTimeout(go,1500)}
+async function saveCfg(){const r=await api("/settings/store",{method:"PATCH",body:JSON.parse(cfg.value)});alert(r.error||"บันทึกแล้ว")}
+go();
+setInterval(()=>{
+ if(cur!=='dashboard'||document.hidden||!dashCache)return;
+ const since=document.getElementById('dashSince'),until=document.getElementById('dashUntil'),campaign=document.getElementById('dashCampaign');
+ if(!since||!until||!campaign||since.value!==dashCache.since||until.value!==dashCache.until||campaign.value!==dashCampaign)return;
+ if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;
+ go();
+},20000);
+</script></html>"""
+
+
+# วิธีเชื่อมระบบจริง (คง META_ACCESS_TOKEN / APP_TOKEN เดิม)
+# 1) เปิดไฟล์นี้ด้วย py "meta_buyer_intelligence.py.txt" แล้วเข้าเมนูรับออเดอร์จากแชต
+#    วางแชตเพื่อทดสอบได้ทันที ช่องรหัสแชตเดียวกันจะรวมข้อมูลออเดอร์เดียวกัน
+#    ข้อความ สั่งเพิ่ม/สั่งอีก/ซื้ออีก/ออเดอร์ใหม่ จะเริ่มรอบใหม่อัตโนมัติ
+#    หรือเลือกเริ่มออเดอร์ใหม่ก่อนรับข้อความชุดใหม่ หากลูกค้าไม่ได้ระบุคำเหล่านี้
+#    ที่อยู่ยืนยันการสั่งซื้อ แต่ไม่ยืนยันรับเงินหรือส่งสำเร็จ
+# 2) รับแชตอัตโนมัติต้องตั้ง Callback HTTPS ที่เข้าถึงเครื่องนี้ได้และให้บริการต่อเนื่อง
+#    ห้ามเปิด API ภายนอกโดยไม่มี APP_TOKEN; ใช้ตัวเดิมถ้าตั้งไว้แล้ว
+#    Messenger: Callback /webhooks/messenger; กำหนด WEBHOOK_VERIFY_TOKEN ใน config.env
+#    ใช้ META_APP_SECRET ของแอปเดิมตรวจลายเซ็น X-Hub-Signature-256
+#    สมัคร Webhook ของ Facebook Page สำหรับ messages/message_echoes ด้วยสิทธิ์ที่ Meta อนุมัติ
+#    ทดสอบ event จริงก่อนเปิดใช้งาน; ไม่ดึงประวัติแชตโดยใช้ Ads token และไม่ส่งแชตตอบลูกค้า
+#    LINE OA: Callback /webhooks/line; LINE_CHANNEL_SECRET ใช้ตรวจ X-Line-Signature
+#    เปิด Use Webhook ของ LINE Messaging API; รับข้อความส่วนตัวแบบข้อความเท่านั้น
+#    VERIFY_WITH_CURRENT_META_DOCS: ตรวจสิทธิ์ Page, subscription และ payload กับรุ่นที่ใช้อยู่
+# 3) Flash Express: บัญชีที่ลงทะเบียนใช้งานหน้าเว็บยังต้องตรวจสิทธิ์ Open API แยกต่างหาก
+#    ขอเอกสาร API สำหรับบัญชีประเทศไทยจาก Flash ผ่านช่องทางทางการในบัญชีของคุณ
+#    ต้องมีคู่มือ URL, การเซ็นคำขอ, webhook signature, รหัสสถานะพัสดุ และรายงาน COD
+#    ไม่ส่งรหัสผ่าน/API secret ในแชต ไม่เดา endpoint หรือปิดการตรวจ HTTPS
+#    ตอนนี้สร้างพัสดุใน Flash แล้วผูกเลขในเมนู Flash Express ได้
+#    นำเข้าไฟล์ CSV ที่แปลงหัวตารางเป็น tracking_number,status,event_time,cod_amount,event_id
+#    status = SHIPPED | IN_TRANSIT | DELIVERED | REFUSED | RETURNED | COD_COLLECTED
+#    event_time ใช้ ISO 8601 เช่น 2026-10-05T10:00:00+07:00
+#    COD_COLLECTED ต้องระบุ cod_amount ที่ขนส่งโอนจริง (ไม่ใช้ราคาขายเดา)
+#    ไฟล์เดิมนำเข้าซ้ำจะไม่บวกเงินซ้ำ; รายงานแถวที่ไม่ผ่านตรวจสอบ
+#    POST /api/shipping/events ใช้รูปแบบเดียวกับ CSV และ X-Token: APP_TOKEN เดิม
+#    รูปแบบนี้เป็นสัญญาของโปรแกรม ไม่ใช่ payload ดั้งเดิมที่ยืนยันแล้วของ Flash
+#    เมื่อได้เอกสาร Flash จึงเพิ่ม adapter ตรวจลายเซ็นและแปลงรหัสสถานะได้
+# 4) ราคาที่ตั้งใน Store config เป็นยอดรวมแพ็กเกจตามร้านเดิม ต้องปรับให้ตรงร้านก่อนใช้จริง
+#    ถ้าแชตไม่มีราคา/จำนวน/วิธีชำระ จะไม่เดาข้อมูล ให้เติมในรายละเอียดออเดอร์
+#    ระบบอ่านที่อยู่จากข้อความภาษาไทย ไม่อ่านข้อความจากรูปภาพ/เสียงหรือยืนยันสลิปธนาคาร
+#    การเปลี่ยน APP_SECRET ทำให้ข้อมูลส่วนตัวเก่าถอดไม่ได้ ต้องเก็บ key เดิมและสำรองฐานข้อมูล
+#    การเข้ารหัส PII เดิมเป็น stdlib prototype ตามต้นฉบับ ไม่อ้างว่าเทียบเท่า AES-GCM/KMS
+#    ก่อนใช้งานบริษัทจริงต้องจัดเก็บ PII/key ด้วยระบบ production ที่ตรวจสอบแล้ว
+
+def extend_token():
+    """แลกโทเคนอายุสั้นเป็นอายุ ~60 วัน แล้วเขียนทับ META_ACCESS_TOKEN ใน config.env/.env"""
+    tok, aid, sec = env("META_ACCESS_TOKEN"), env("META_APP_ID", "1274393901342976"), env("META_APP_SECRET")
+    if not tok: print("ไม่พบ META_ACCESS_TOKEN ใน config.env - วางโทเคนก่อน"); return
+    if not sec:
+        import getpass
+        sec = getpass.getpass("Paste App Secret then press Enter (hidden, nothing will show): ").strip()
+    if not sec: print("ไม่ได้ใส่ App Secret"); return
+    url = f"https://graph.facebook.com/{env('META_GRAPH_API_VERSION', 'v21.0')}/oauth/access_token?" + urllib.parse.urlencode(
+        {"grant_type": "fb_exchange_token", "client_id": aid, "client_secret": sec, "fb_exchange_token": tok})
+    try: d = json.load(urllib.request.urlopen(url, timeout=30))
+    except urllib.error.HTTPError as e:
+        try: msg = json.load(e).get("error", {}).get("message", "")
+        except Exception: msg = ""
+        print("ต่ออายุไม่สำเร็จ:", msg or e.code, "\n(ถ้าโทเคนหมดอายุแล้ว ให้ Generate ใหม่ใน Graph API Explorer แล้วลองอีกครั้ง)"); return
+    except Exception as e: print("ต่ออายุไม่สำเร็จ:", type(e).__name__); return
+    new = d.get("access_token")
+    if not new: print("Meta ไม่ส่งโทเคนกลับมา"); return
+    done = False
+    for f in (".env", "config.env"):
+        path = os.path.join(ROOT, f)
+        if os.path.exists(path):
+            txt = open(path, encoding="utf-8-sig").read()
+            if re.search(r"(?m)^META_ACCESS_TOKEN=", txt):
+                open(path, "w", encoding="utf-8").write(re.sub(r"(?m)^META_ACCESS_TOKEN=.*$", lambda m: "META_ACCESS_TOKEN=" + new, txt)); done = True; break
+    print(f"สำเร็จ! โทเคนใหม่อายุประมาณ {int(d.get('expires_in', 0)) // 86400} วัน", "- บันทึกลง config.env แล้ว ปิดและเปิดโปรแกรมใหม่" if done else "- แต่หาไฟล์ config.env ไม่เจอ จึงยังไม่ได้บันทึก")
+
+def boot():
+    JOB["running"] = True
+    try:
+        if env("META_ACCESS_TOKEN") and q("select 1 x from audit_logs where actor='seed' limit 1", one=True):
+            q("DELETE FROM orders WHERE tenant_id=? AND id IN (SELECT CAST(substr(entity,7) AS INTEGER) FROM audit_logs WHERE tenant_id=? AND actor='seed' AND action='order.create' AND entity LIKE 'order:%')",(TENANT,TENANT),commit=True)
+            q("DELETE FROM ad_insights WHERE tenant_id=? AND (campaign_id='DEMO_CAMPAIGN' OR ad_id IN ('AD_Video_ชานมเย็น','AD_Image_โปรสามโหล','AD_Carousel_ทั่วไป','AD_Reels_ทดสอบ'))",(TENANT,),commit=True)
+            q("DELETE FROM audit_logs WHERE tenant_id=? AND actor='seed'",(TENANT,),commit=True)
+            print("ล้างข้อมูลเดโมแล้ว - ใช้ข้อมูลจริง")
+        if not q("select 1 x from orders limit 1", one=True) and not env("META_ACCESS_TOKEN"): print("กำลังสร้างข้อมูลเดโม..."); seed()
+    except Exception as e: JOB["error"] = "boot: " + str(e)[:150]
+    finally: JOB["running"] = False
+    if not q("select 1 x from orders limit 1", one=True):
+        q("delete from recommendations where status='PENDING'", commit=True)
+        q("delete from alert_events where alert_key like 'nocpa:%' or alert_key like 'cpm:%' or alert_key like 'scale:%' or alert_key like 'reduce:%'", commit=True)
+    run_sync(30 if env('META_ACCESS_TOKEN') else 7); loop()
+
+if __name__ == "__main__":
+    try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception: pass
+    if len(sys.argv) > 1 and sys.argv[1] == "--extend": extend_token(); sys.exit()
+    init_db(); srv = None; host = "0.0.0.0" if TOKEN else "127.0.0.1"
+    for port in range(PORT, PORT + 10):
+        try: srv = ThreadingHTTPServer((host, port), H); break
+        except OSError: continue
+    if not srv: print("เปิดพอร์ตไม่ได้ ลองตั้ง PORT=9000 แล้วรันใหม่"); sys.exit(1)
+    threading.Thread(target=boot, daemon=True).start()
+    url = f"http://localhost:{port}"
+    print(f"Meta Buyer Intelligence [{JOB['mode']}] -> {url}" + ("" if TOKEN else "  (ยังไม่ได้ตั้ง APP_TOKEN: ใช้เฉพาะเครื่องตัวเอง)"))
+    print("เปิดเบราว์เซอร์ให้อัตโนมัติ; ถ้าไม่ขึ้นให้เปิดลิงก์ด้านบนเอง. หยุดโปรแกรม: Ctrl+C")
+    threading.Timer(1, lambda: webbrowser.open(url)).start()
+    try: srv.serve_forever()
+    except KeyboardInterrupt: pass
